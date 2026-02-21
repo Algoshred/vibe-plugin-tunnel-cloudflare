@@ -1,0 +1,44 @@
+{
+  "name": "@burdenoff/vibe-plugin-tunnel-cloudflare",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "description": "Cloudflare Tunnel provider for VibeControls Agent",
+  "author": {
+    "name": "Vignesh T.V",
+    "email": "vignesh@burdenoff.com"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint ./src",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "type:check": "tsc --noEmit",
+    "sanity": "npm run format:check && npm run lint && npm run type:check && npm run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3",
+    "eslint": "^10.0.1",
+    "prettier": "^3.8.1"
+  },
+  "peerDependencies": {
+    "@burdenoff/vibe-agent": ">=2.0.0"
+  },
+  "keywords": [
+    "vibecontrols",
+    "vibe-plugin",
+    "cloudflare",
+    "tunnel"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "files": [
+    "dist/**/*"
+  ]
+}
