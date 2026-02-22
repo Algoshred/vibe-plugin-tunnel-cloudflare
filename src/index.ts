@@ -11,8 +11,7 @@
  *   - "agent-tunnel-pid" → string (PID of the agent tunnel process)
  */
 
-import { type ChildProcess, spawn, execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import type { Subprocess } from "bun";
 
 // ---------------------------------------------------------------------------
 // Types — locally defined to avoid hard dependency on @burdenoff/vibe-agent.
@@ -157,112 +156,81 @@ function isProcessAlive(pid: number): boolean {
 /**
  * Gracefully terminate a process: SIGTERM first, then SIGKILL after a timeout.
  */
-async function gracefulKill(proc: ChildProcess, pid: number): Promise<void> {
+async function gracefulKill(_proc: Subprocess, pid: number): Promise<void> {
   // Already dead — nothing to do.
   if (!isProcessAlive(pid)) return;
 
-  proc.kill("SIGTERM");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return;
+  }
 
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      if (isProcessAlive(pid)) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Already gone — ignore.
-        }
-      }
-      resolve();
-    }, KILL_GRACE_MS);
+  const deadline = Date.now() + KILL_GRACE_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (!isProcessAlive(pid)) return;
+  }
 
-    // If the process exits before the timeout we can resolve early.
-    proc.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
+  // Force kill if still alive.
+  if (isProcessAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone — ignore.
+    }
+  }
 }
 
 /**
  * Spawn `cloudflared tunnel` and wait for the quick-tunnel URL to appear on
- * stderr/stdout.
- *
- * IMPORTANT: After URL extraction we **resume** the stdio streams but do NOT
- * destroy them. Destroying piped streams sends SIGPIPE to the child which
- * would kill the tunnel process.
+ * stderr/stdout. Uses Bun's ReadableStream APIs.
  */
-function extractTunnelUrl(proc: ChildProcess): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    let settled = false;
-    let combined = "";
+async function extractTunnelUrl(proc: Subprocess): Promise<string> {
+  let combined = "";
 
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        cleanup();
-        reject(
-          new Error(
-            `Timed out after ${URL_EXTRACT_TIMEOUT_MS}ms waiting for tunnel URL`,
-          ),
-        );
+  // Read from both stdout and stderr concurrently. cloudflared may print the
+  // URL on either stream.
+  const readStream = async (stream: ReadableStream<Uint8Array> | null) => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        combined += decoder.decode(value, { stream: true });
+        const match = TUNNEL_URL_RE.exec(combined);
+        if (match) return match[1]!;
       }
-    }, URL_EXTRACT_TIMEOUT_MS);
-
-    const onData = (chunk: Buffer): void => {
-      if (settled) return;
-      combined += chunk.toString();
-
-      const match = TUNNEL_URL_RE.exec(combined);
-      if (match) {
-        settled = true;
-        clearTimeout(timeout);
-        cleanup();
-        resolve(match[1]!);
-      }
-    };
-
-    const onError = (err: Error): void => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        cleanup();
-        reject(err);
-      }
-    };
-
-    const onExit = (code: number | null): void => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        cleanup();
-        reject(
-          new Error(
-            `cloudflared exited with code ${code} before producing a URL`,
-          ),
-        );
-      }
-    };
-
-    /**
-     * Remove all listeners we attached and resume the streams so they don't
-     * buffer indefinitely. We intentionally do NOT destroy() the streams.
-     */
-    function cleanup(): void {
-      proc.stdout?.removeListener("data", onData);
-      proc.stderr?.removeListener("data", onData);
-      proc.removeListener("error", onError);
-      proc.removeListener("exit", onExit);
-
-      // Resume streams so the child process doesn't block on write().
-      proc.stdout?.resume();
-      proc.stderr?.resume();
+    } finally {
+      reader.releaseLock();
     }
+    return undefined;
+  };
 
-    proc.stdout?.on("data", onData);
-    proc.stderr?.on("data", onData);
-    proc.once("error", onError);
-    proc.once("exit", onExit);
-  });
+  // Race both streams and a timeout.
+  const result = await Promise.race([
+    readStream(proc.stdout as ReadableStream<Uint8Array> | null),
+    readStream(proc.stderr as ReadableStream<Uint8Array> | null),
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Timed out after ${URL_EXTRACT_TIMEOUT_MS}ms waiting for tunnel URL`,
+            ),
+          ),
+        URL_EXTRACT_TIMEOUT_MS,
+      ),
+    ),
+  ]);
+
+  if (!result) {
+    throw new Error("cloudflared exited before producing a URL");
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,8 +240,8 @@ function extractTunnelUrl(proc: ChildProcess): Promise<string> {
 class CloudflareTunnelProvider implements TunnelProvider {
   readonly name = PROVIDER_NAME;
 
-  /** In-memory map of tunnel ID → spawned ChildProcess. */
-  private readonly processes = new Map<string, ChildProcess>();
+  /** In-memory map of tunnel ID → spawned Subprocess. */
+  private readonly processes = new Map<string, Subprocess>();
 
   private readonly storage: StorageProvider;
   private readonly log: Logger;
@@ -294,7 +262,9 @@ class CloudflareTunnelProvider implements TunnelProvider {
     try {
       return JSON.parse(raw) as TunnelInfo[];
     } catch {
-      this.log.warn("[tunnel-cloudflare] Corrupt tunnel list in storage — resetting");
+      this.log.warn(
+        "[tunnel-cloudflare] Corrupt tunnel list in storage — resetting",
+      );
       return [];
     }
   }
@@ -327,7 +297,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
   // -----------------------------------------------------------------------
 
   async start(config: TunnelConfig): Promise<TunnelInfo> {
-    const id = randomUUID();
+    const id = crypto.randomUUID();
     const protocol = config.protocol ?? "http";
     const localUrl = `${protocol}://${config.hostname ?? "localhost"}:${config.port}`;
     const now = new Date().toISOString();
@@ -349,25 +319,20 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Persist the "starting" record immediately so callers can track it.
     await this.upsertTunnel(info);
 
-    this.log.info(
-      `[tunnel-cloudflare] Starting tunnel ${id} → ${localUrl}`,
-    );
+    this.log.info(`[tunnel-cloudflare] Starting tunnel ${id} → ${localUrl}`);
 
-    // Spawn cloudflared as a detached process so it survives short-lived
-    // parent re-spawns. stdio is piped so we can capture the URL.
-    const proc = spawn("cloudflared", ["tunnel", "--url", localUrl], {
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
+    // Spawn cloudflared. stdio is piped so we can capture the URL.
+    const proc = Bun.spawn(["cloudflared", "tunnel", "--url", localUrl], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
     });
-
-    // Prevent the parent from waiting on the child.
-    proc.unref();
 
     // Track the process in-memory.
     this.processes.set(id, proc);
 
-    // Handle unexpected early death.
-    proc.once("exit", (code) => {
+    // Monitor for unexpected early death in the background.
+    void proc.exited.then((code) => {
       // Only act if the tunnel wasn't intentionally stopped (still in map).
       if (this.processes.has(id)) {
         this.log.warn(
@@ -391,26 +356,25 @@ class CloudflareTunnelProvider implements TunnelProvider {
     try {
       const url = await extractTunnelUrl(proc);
 
-      const pid = proc.pid;
       const activeInfo: TunnelInfo = {
         ...info,
         url,
         status: "active",
-        pid: pid ?? undefined,
+        pid: proc.pid,
         updatedAt: new Date().toISOString(),
       };
 
       await this.upsertTunnel(activeInfo);
 
       this.log.info(
-        `[tunnel-cloudflare] Tunnel ${id} active at ${url} (PID ${pid})`,
+        `[tunnel-cloudflare] Tunnel ${id} active at ${url} (PID ${proc.pid})`,
       );
 
       return activeInfo;
     } catch (err) {
       // URL extraction failed — kill the process and record error state.
       this.processes.delete(id);
-      if (proc.pid && isProcessAlive(proc.pid)) {
+      if (isProcessAlive(proc.pid)) {
         await gracefulKill(proc, proc.pid);
       }
 
@@ -444,7 +408,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
 
     // Kill the in-memory process if we still have a handle.
     const proc = this.processes.get(tunnelId);
-    if (proc?.pid) {
+    if (proc) {
       await gracefulKill(proc, proc.pid);
       this.processes.delete(tunnelId);
     } else if (tunnel?.pid && isProcessAlive(tunnel.pid)) {
@@ -535,10 +499,15 @@ class CloudflareTunnelProvider implements TunnelProvider {
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const version = execSync("cloudflared --version", {
-        encoding: "utf-8",
+      const result = Bun.spawnSync(["cloudflared", "--version"], {
+        stdout: "pipe",
+        stderr: "pipe",
         timeout: 10_000,
-      }).trim();
+      });
+      if (result.exitCode !== 0) {
+        return { ok: false, message: "cloudflared not available" };
+      }
+      const version = result.stdout.toString().trim();
       return { ok: true, message: version };
     } catch (err) {
       return {
@@ -576,9 +545,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
       await this.storage.set(STORAGE_NS, KEY_AGENT_PID, String(info.pid));
     }
 
-    this.log.info(
-      `[tunnel-cloudflare] Agent tunnel active at ${info.url}`,
-    );
+    this.log.info(`[tunnel-cloudflare] Agent tunnel active at ${info.url}`);
 
     return info;
   }
@@ -601,7 +568,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Kill any lingering in-memory processes that weren't in the persisted
     // list (defensive — shouldn't normally happen).
     for (const [id, proc] of this.processes) {
-      if (proc.pid && isProcessAlive(proc.pid)) {
+      if (isProcessAlive(proc.pid)) {
         this.log.warn(
           `[tunnel-cloudflare] Killing orphaned process ${proc.pid} (tunnel ${id})`,
         );
@@ -613,7 +580,9 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Wipe all storage keys for a clean slate.
     await this.storage.deleteAll(STORAGE_NS);
 
-    this.log.info("[tunnel-cloudflare] All tunnels stopped and storage cleared");
+    this.log.info(
+      "[tunnel-cloudflare] All tunnels stopped and storage cleared",
+    );
   }
 }
 

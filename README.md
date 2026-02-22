@@ -26,14 +26,14 @@ npm install -g @burdenoff/vibe-plugin-tunnel-cloudflare
 
 This plugin registers a `tunnel` provider with the following capabilities:
 
-| Method | Description |
-| --- | --- |
+| Method          | Description                                    |
+| --------------- | ---------------------------------------------- |
 | `start(config)` | Start a new Cloudflare tunnel for a local port |
-| `stop(id)` | Stop a running tunnel |
-| `get(id)` | Get tunnel info by ID |
-| `list()` | List all managed tunnels |
-| `delete(id)` | Delete a tunnel record |
-| `getStatus()` | Get overall tunnel provider status |
+| `stop(id)`      | Stop a running tunnel                          |
+| `get(id)`       | Get tunnel info by ID                          |
+| `list()`        | List all managed tunnels                       |
+| `delete(id)`    | Delete a tunnel record                         |
+| `getStatus()`   | Get overall tunnel provider status             |
 
 ## Requirements
 

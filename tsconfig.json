@@ -12,7 +12,7 @@
     "declarationMap": true,
     "sourceMap": true,
     "resolveJsonModule": true,
-    "types": ["node"],
+    "types": ["node", "bun-types"],
     "lib": ["ESNext"],
     "allowImportingTsExtensions": false,
     "noEmit": false
