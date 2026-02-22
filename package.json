@@ -1,44 +1,69 @@
 {
   "name": "@burdenoff/vibe-plugin-tunnel-cloudflare",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Cloudflare Tunnel provider for VibeControls Agent",
+  "engines": {
+    "bun": ">=1.3.0"
+  },
   "author": {
     "name": "Vignesh T.V",
-    "email": "vignesh@burdenoff.com"
+    "email": "vignesh@burdenoff.com",
+    "url": "https://github.com/tvvignesh"
   },
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "eslint ./src",
-    "format": "prettier . --write",
-    "format:check": "prettier . --check",
+    "format": "bunx prettier . --write",
+    "format:check": "bunx prettier . --check",
     "type:check": "tsc --noEmit",
-    "sanity": "npm run format:check && npm run lint && npm run type:check && npm run build"
+    "clean": "rimraf dist",
+    "prebuild": "bun run clean",
+    "prepublishOnly": "bun run build",
+    "sanity": "bun run format:check && bun run lint && bun run type:check && bun run build"
   },
   "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.9.3",
-    "eslint": "^10.0.1",
-    "prettier": "^3.8.1"
+    "eslint": "^9.30.1",
+    "prettier": "^3.6.2",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "@burdenoff/vibe-agent": ">=2.0.0"
   },
+  "peerDependenciesMeta": {
+    "@burdenoff/vibe-agent": {
+      "optional": true
+    }
+  },
   "keywords": [
     "vibecontrols",
+    "vibe",
     "vibe-plugin",
     "cloudflare",
-    "tunnel"
+    "tunnel",
+    "bun"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algoshred/vibe-plugin-tunnel-cloudflare.git"
+  },
+  "bugs": {
+    "url": "https://github.com/algoshred/vibe-plugin-tunnel-cloudflare/issues"
+  },
+  "homepage": "https://vibecontrols.com",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
-    "dist/**/*"
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
   ]
 }
