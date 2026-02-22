@@ -92,6 +92,9 @@ interface VibePlugin {
   name: string;
   version: string;
   description?: string;
+  tags?: Array<
+    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
+  >;
   cliCommand?: string;
   apiPrefix?: string;
   dependencies?: string[];
@@ -625,6 +628,7 @@ export const vibePlugin: VibePlugin = {
   name: "tunnel-cloudflare",
   version: "1.0.0",
   description: "Cloudflare Tunnel provider for remote access",
+  tags: ["backend", "provider"],
 
   // The `tunnel` slot is populated at runtime during onServerStart.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
