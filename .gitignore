@@ -13,3 +13,4 @@ bun.lock.workspace
 *.log
 sanity.log
 .npmrc
+temp/
