@@ -470,6 +470,9 @@ class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   async getActiveTunnelUrl(): Promise<string | null> {
+    // In external-tunnel mode (AGENT_TUNNEL=false), the URL is passed via env var.
+    const envUrl = process.env.AGENT_TUNNEL_URL;
+    if (envUrl) return envUrl;
     return this.storage.get(STORAGE_NS, KEY_AGENT_URL);
   }
 
@@ -495,6 +498,18 @@ class CloudflareTunnelProvider implements TunnelProvider {
     await this.removeTunnelRecord(tunnelId);
 
     this.log.info(`[tunnel-cloudflare] Tunnel ${tunnelId} deleted`);
+  }
+
+  /**
+   * Detach from all tracked processes without killing them.
+   * Used in AGENT_TUNNEL_DETACH mode so the tunnel survives a server restart.
+   * Storage is preserved so the next startAgentTunnel can reconnect.
+   */
+  detachAll(): void {
+    this.log.info(
+      "[tunnel-cloudflare] Detaching from all tunnels (processes left running)",
+    );
+    this.processes.clear();
   }
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
@@ -527,8 +542,35 @@ class CloudflareTunnelProvider implements TunnelProvider {
   /**
    * Start the "agent tunnel" — the primary tunnel pointing at the agent's
    * own HTTP port so the agent is reachable from the internet.
+   *
+   * If AGENT_TUNNEL_DETACH=true and a previous cloudflared process is still
+   * alive (e.g. after a watch-mode restart), reuses that process instead of
+   * spawning a new one. This keeps the tunnel URL stable across hot-reloads.
    */
   async startAgentTunnel(agentPort: number): Promise<TunnelInfo> {
+    // Reuse existing tunnel if the process is still alive.
+    const storedPidStr = await this.storage.get(STORAGE_NS, KEY_AGENT_PID);
+    const storedUrl = await this.storage.get(STORAGE_NS, KEY_AGENT_URL);
+
+    if (storedPidStr && storedUrl) {
+      const storedPid = parseInt(storedPidStr, 10);
+      if (!isNaN(storedPid) && isProcessAlive(storedPid)) {
+        this.log.info(
+          `[tunnel-cloudflare] Reusing existing agent tunnel (pid=${storedPid}) at ${storedUrl}`,
+        );
+        // Reconstruct a TunnelInfo so callers get consistent data.
+        const tunnels = await this.loadTunnels();
+        const existing = tunnels.find(
+          (t) => t.pid === storedPid && t.metadata?.isAgentTunnel,
+        );
+        if (existing) {
+          // Re-register in-memory so stop()/list() work correctly.
+          // We don't have the Subprocess handle, but PID-based kill still works.
+          return existing;
+        }
+      }
+    }
+
     this.log.info(
       `[tunnel-cloudflare] Starting agent tunnel on port ${agentPort}`,
     );
@@ -612,6 +654,17 @@ export const vibePlugin: VibePlugin = {
     provider = new CloudflareTunnelProvider(hostServices);
     vibePlugin.providers!.tunnel = provider;
 
+    // AGENT_TUNNEL=false: external process owns the tunnel (e.g. dev-reload.sh).
+    // Register the provider so manual API calls work, but skip spawning cloudflared.
+    // The tunnel URL is provided via AGENT_TUNNEL_URL env var and read by
+    // getActiveTunnelUrl() so auto-report still works correctly.
+    if (process.env.AGENT_TUNNEL === "false") {
+      log.info(
+        "[tunnel-cloudflare] AGENT_TUNNEL=false — provider registered, tunnel managed externally",
+      );
+      return;
+    }
+
     // Pre-flight: make sure cloudflared is available.
     const health = await provider.healthCheck();
     if (!health.ok) {
@@ -650,6 +703,18 @@ export const vibePlugin: VibePlugin = {
 
   async onServerStop(): Promise<void> {
     if (!provider) return;
+
+    // AGENT_TUNNEL=false: external process owns the tunnel, nothing to kill here.
+    // AGENT_TUNNEL_DETACH=true: leave cloudflared running so the tunnel URL
+    // survives a watch-mode restart (storage preserved for next boot to reconnect).
+    if (
+      process.env.AGENT_TUNNEL === "false" ||
+      process.env.AGENT_TUNNEL_DETACH === "true"
+    ) {
+      provider.detachAll();
+      provider = null;
+      return;
+    }
 
     await provider.stopAll();
     provider = null;
