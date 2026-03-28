@@ -1,6 +1,6 @@
 # @burdenoff/vibe-plugin-tunnel-cloudflare
 
-Cloudflare Tunnel provider for [VibeControls Agent](https://www.npmjs.com/package/@burdenoff/vibe-agent).
+Cloudflare Tunnel provider for [VibeControls Agent](https://www.npmjs.com/package/@vibecontrols/agent).
 
 ## Installation
 

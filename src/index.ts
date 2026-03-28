@@ -14,7 +14,7 @@
 import type { Subprocess } from "bun";
 
 // ---------------------------------------------------------------------------
-// Types — locally defined to avoid hard dependency on @burdenoff/vibe-agent.
+// Types — locally defined to avoid hard dependency on @vibecontrols/agent.
 // These mirror the canonical interfaces from the core agent package.
 // ---------------------------------------------------------------------------
 
