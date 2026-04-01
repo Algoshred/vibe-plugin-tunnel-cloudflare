@@ -127,8 +127,9 @@ const KEY_AGENT_URL = "agent-tunnel-url";
 /** Key for the agent tunnel process PID. */
 const KEY_AGENT_PID = "agent-tunnel-pid";
 
-/** Regex to extract the quick-tunnel URL from cloudflared output. */
-const TUNNEL_URL_RE = /(https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com)/;
+/** Regex to extract the quick-tunnel URL from cloudflared output.
+ * Excludes api.trycloudflare.com which is the API endpoint, not the tunnel URL. */
+const TUNNEL_URL_RE = /(https:\/\/(?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com)/;
 
 /** Maximum time (ms) to wait for cloudflared to print its URL. */
 const URL_EXTRACT_TIMEOUT_MS = 30_000;
