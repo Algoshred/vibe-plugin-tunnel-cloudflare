@@ -19,36 +19,89 @@ import type { Subprocess } from "bun";
 // ---------------------------------------------------------------------------
 
 type TunnelStatus = "starting" | "active" | "stopping" | "stopped" | "error";
+type TunnelProtocol = "http" | "https" | "tcp" | "udp";
 
-interface TunnelConfig {
-  port: number;
-  hostname?: string;
-  protocol?: "http" | "https";
-  name?: string;
+interface TunnelProviderCapabilities {
+  provider: string;
+  supportsHttp: boolean;
+  supportsHttps: boolean;
+  supportsTcp: boolean;
+  supportsUdp: boolean;
+  supportsCustomDomains: boolean;
+  supportsManagedSubdomains: boolean;
+  supportsSessionTokens: boolean;
+  supportsLiveLogs: boolean;
+  supportsUsageMetrics: boolean;
+  supportsRotateCredentials: boolean;
+  platforms: string[];
+}
+
+interface IssueSessionRequest {
+  protocol: TunnelProtocol;
+  localPort: number;
+  localHost?: string;
+  subdomain?: string;
+  customDomain?: string;
+  ttlSeconds?: number;
   metadata?: Record<string, unknown>;
+  controlPlanePayload?: Record<string, unknown>;
+}
+
+interface TunnelSessionInfo {
+  sessionId: string;
+  tunnelId: string;
+  provider: string;
+  managedHostname?: string;
+  customDomains?: string[];
+  expiresAt?: string;
+  credentials: Record<string, unknown>;
+}
+
+interface TunnelMetrics {
+  bytesIn: number;
+  bytesOut: number;
+  connections: number;
+  lastActivityAt?: string;
 }
 
 interface TunnelInfo {
   id: string;
-  url: string;
-  port: number;
+  providerName: string;
   status: TunnelStatus;
-  provider: string;
+  protocol: TunnelProtocol;
+  localPort: number;
+  localHost: string;
+  url: string;
+  managedHostname?: string;
+  customDomains?: string[];
+  sessionId?: string;
+  shardId?: string;
   pid?: number;
   createdAt: string;
   updatedAt?: string;
+  metrics?: TunnelMetrics;
   metadata?: Record<string, unknown>;
 }
 
 interface TunnelProvider {
   readonly name: string;
-  start(config: TunnelConfig): Promise<TunnelInfo>;
+  getCapabilities(): TunnelProviderCapabilities;
+  healthCheck(): Promise<{
+    ok: boolean;
+    message?: string;
+    details?: Record<string, unknown>;
+  }>;
+  issueSession(req: IssueSessionRequest): Promise<TunnelSessionInfo>;
+  start(tunnelId: string): Promise<TunnelInfo>;
   stop(tunnelId: string): Promise<void>;
-  getStatus(tunnelId: string): Promise<TunnelInfo | null>;
-  getActiveTunnelUrl(): Promise<string | null>;
-  list(): Promise<TunnelInfo[]>;
   delete(tunnelId: string): Promise<void>;
-  healthCheck(): Promise<{ ok: boolean; message?: string }>;
+  rotate(tunnelId: string): Promise<TunnelSessionInfo>;
+  getStatus(tunnelId: string): Promise<TunnelInfo | null>;
+  list(): Promise<TunnelInfo[]>;
+  attachCustomDomain(tunnelId: string, domain: string): Promise<void>;
+  detachCustomDomain(tunnelId: string, domain: string): Promise<void>;
+  listSessions(tunnelId: string): Promise<TunnelSessionInfo[]>;
+  getActiveTunnelUrl?(): Promise<string | null>;
 }
 
 interface StorageProvider {
@@ -297,88 +350,148 @@ class CloudflareTunnelProvider implements TunnelProvider {
   // TunnelProvider implementation
   // -----------------------------------------------------------------------
 
-  async start(config: TunnelConfig): Promise<TunnelInfo> {
-    const id = crypto.randomUUID();
-    const protocol = config.protocol ?? "http";
-    const localUrl = `${protocol}://${config.hostname ?? "localhost"}:${config.port}`;
+  getCapabilities(): TunnelProviderCapabilities {
+    return {
+      provider: PROVIDER_NAME,
+      supportsHttp: true,
+      supportsHttps: true,
+      supportsTcp: false,
+      supportsUdp: false,
+      // trycloudflare quick tunnels don't support customer-owned custom
+      // domains. Named tunnels support them but require a Cloudflare Zero
+      // Trust account and are not implemented yet.
+      supportsCustomDomains: false,
+      supportsManagedSubdomains: true,
+      supportsSessionTokens: false,
+      supportsLiveLogs: true,
+      supportsUsageMetrics: false,
+      supportsRotateCredentials: true,
+      platforms: ["darwin", "linux", "win32"],
+    };
+  }
+
+  async issueSession(req: IssueSessionRequest): Promise<TunnelSessionInfo> {
+    const tunnelId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const localHost = req.localHost ?? "127.0.0.1";
+    const protocol: TunnelProtocol = req.protocol;
     const now = new Date().toISOString();
 
     const info: TunnelInfo = {
-      id,
-      url: "", // Populated after URL extraction.
-      port: config.port,
-      status: "starting",
-      provider: PROVIDER_NAME,
+      id: tunnelId,
+      providerName: PROVIDER_NAME,
+      status: "stopped",
+      protocol,
+      localPort: req.localPort,
+      localHost,
+      url: "",
+      sessionId,
       createdAt: now,
       metadata: {
-        ...(config.metadata ?? {}),
-        ...(config.name ? { name: config.name } : {}),
-        localUrl,
+        ...(req.metadata ?? {}),
+        localUrl: `${protocol}://${localHost}:${req.localPort}`,
       },
     };
-
-    // Persist the "starting" record immediately so callers can track it.
     await this.upsertTunnel(info);
 
-    this.log.info(`[tunnel-cloudflare] Starting tunnel ${id} → ${localUrl}`);
+    const session: TunnelSessionInfo = {
+      sessionId,
+      tunnelId,
+      provider: PROVIDER_NAME,
+      expiresAt: req.ttlSeconds
+        ? new Date(Date.now() + req.ttlSeconds * 1000).toISOString()
+        : undefined,
+      credentials: {
+        localUrl: info.metadata!["localUrl"],
+      },
+    };
+    // cloudflare's sessions are 1:1 with tunnels — persist the single session
+    // via a session list keyed by tunnelId.
+    await this.storage.set(
+      STORAGE_NS,
+      `sessions:${tunnelId}`,
+      JSON.stringify([session]),
+    );
+    return session;
+  }
 
-    // Spawn cloudflared. stdio is piped so we can capture the URL.
+  /**
+   * Start a previously-issued tunnel. Spawns cloudflared and extracts the
+   * public URL from its output.
+   */
+  async start(tunnelId: string): Promise<TunnelInfo> {
+    const tunnels = await this.loadTunnels();
+    const info = tunnels.find((t) => t.id === tunnelId);
+    if (!info) {
+      throw new Error(`Tunnel ${tunnelId} not found (issueSession first)`);
+    }
+
+    if (this.processes.has(tunnelId)) {
+      return info;
+    }
+
+    const localUrl =
+      (info.metadata?.["localUrl"] as string | undefined) ??
+      `${info.protocol}://${info.localHost}:${info.localPort}`;
+
+    await this.upsertTunnel({
+      ...info,
+      status: "starting",
+      updatedAt: new Date().toISOString(),
+    });
+
+    this.log.info(
+      `[tunnel-cloudflare] Starting tunnel ${tunnelId} → ${localUrl}`,
+    );
+
     const proc = Bun.spawn(["cloudflared", "tunnel", "--url", localUrl], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
     });
+    this.processes.set(tunnelId, proc);
 
-    // Track the process in-memory.
-    this.processes.set(id, proc);
-
-    // Monitor for unexpected early death in the background.
     void proc.exited.then((code) => {
-      // Only act if the tunnel wasn't intentionally stopped (still in map).
-      if (this.processes.has(id)) {
+      if (this.processes.has(tunnelId)) {
         this.log.warn(
-          `[tunnel-cloudflare] Tunnel ${id} process exited unexpectedly (code=${code})`,
+          `[tunnel-cloudflare] Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
         );
-        this.processes.delete(id);
-        // Fire-and-forget status update.
-        const errorInfo: TunnelInfo = {
-          ...info,
-          status: "error",
-          updatedAt: new Date().toISOString(),
-          metadata: {
-            ...info.metadata,
-            exitCode: code,
-          },
-        };
-        void this.upsertTunnel(errorInfo);
+        this.processes.delete(tunnelId);
+        void this.loadTunnels().then((current) => {
+          const idx = current.findIndex((t) => t.id === tunnelId);
+          if (idx >= 0) {
+            current[idx] = {
+              ...current[idx]!,
+              status: "error",
+              updatedAt: new Date().toISOString(),
+              metadata: { ...current[idx]!.metadata, exitCode: code },
+            };
+            void this.saveTunnels(current);
+          }
+        });
       }
     });
 
     try {
       const url = await extractTunnelUrl(proc);
-
       const activeInfo: TunnelInfo = {
         ...info,
         url,
+        managedHostname: new URL(url).host,
         status: "active",
         pid: proc.pid,
         updatedAt: new Date().toISOString(),
       };
-
       await this.upsertTunnel(activeInfo);
-
       this.log.info(
-        `[tunnel-cloudflare] Tunnel ${id} active at ${url} (PID ${proc.pid})`,
+        `[tunnel-cloudflare] Tunnel ${tunnelId} active at ${url} (PID ${proc.pid})`,
       );
-
       return activeInfo;
     } catch (err) {
-      // URL extraction failed — kill the process and record error state.
-      this.processes.delete(id);
+      this.processes.delete(tunnelId);
       if (isProcessAlive(proc.pid)) {
         await gracefulKill(proc, proc.pid);
       }
-
       const errorInfo: TunnelInfo = {
         ...info,
         status: "error",
@@ -389,8 +502,50 @@ class CloudflareTunnelProvider implements TunnelProvider {
         },
       };
       await this.upsertTunnel(errorInfo);
-
       throw err;
+    }
+  }
+
+  async rotate(tunnelId: string): Promise<TunnelSessionInfo> {
+    const tunnels = await this.loadTunnels();
+    const info = tunnels.find((t) => t.id === tunnelId);
+    if (!info) throw new Error(`Tunnel ${tunnelId} not found`);
+
+    await this.stop(tunnelId);
+    // Re-use the tunnel's existing target + metadata and spin up a fresh
+    // cloudflared process (which yields a new trycloudflare URL).
+    await this.start(tunnelId);
+    const updated = (await this.loadTunnels()).find((t) => t.id === tunnelId);
+    const sessionId = updated?.sessionId ?? crypto.randomUUID();
+    return {
+      sessionId,
+      tunnelId,
+      provider: PROVIDER_NAME,
+      credentials: {
+        localUrl: updated?.metadata?.["localUrl"] as string | undefined,
+      },
+    };
+  }
+
+  async attachCustomDomain(_tunnelId: string, _domain: string): Promise<void> {
+    throw new Error(
+      "Custom domains are not supported by the cloudflared quick-tunnel provider. Use the vibetunnels provider or wait for named-tunnel support.",
+    );
+  }
+
+  async detachCustomDomain(_tunnelId: string, _domain: string): Promise<void> {
+    throw new Error(
+      "Custom domains are not supported by the cloudflared quick-tunnel provider.",
+    );
+  }
+
+  async listSessions(tunnelId: string): Promise<TunnelSessionInfo[]> {
+    const raw = await this.storage.get(STORAGE_NS, `sessions:${tunnelId}`);
+    if (!raw) return [];
+    try {
+      return JSON.parse(raw) as TunnelSessionInfo[];
+    } catch {
+      return [];
     }
   }
 
@@ -576,11 +731,13 @@ class CloudflareTunnelProvider implements TunnelProvider {
       `[tunnel-cloudflare] Starting agent tunnel on port ${agentPort}`,
     );
 
-    const info = await this.start({
-      port: agentPort,
-      name: "agent",
-      metadata: { isAgentTunnel: true },
+    const session = await this.issueSession({
+      protocol: "https",
+      localPort: agentPort,
+      localHost: "localhost",
+      metadata: { isAgentTunnel: true, name: "agent" },
     });
+    const info = await this.start(session.tunnelId);
 
     // Persist agent-specific keys for quick lookup.
     await this.storage.set(STORAGE_NS, KEY_AGENT_URL, info.url);
@@ -638,7 +795,7 @@ let provider: CloudflareTunnelProvider | null = null;
 
 export const vibePlugin: VibePlugin = {
   name: "tunnel-cloudflare",
-  version: "1.0.0",
+  version: "2.0.0",
   description: "Cloudflare Tunnel provider for remote access",
   tags: ["backend", "provider"],
 
