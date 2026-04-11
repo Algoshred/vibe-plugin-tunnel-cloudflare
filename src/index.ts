@@ -371,7 +371,14 @@ class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   async issueSession(req: IssueSessionRequest): Promise<TunnelSessionInfo> {
-    const tunnelId = crypto.randomUUID();
+    // Reuse the backend tunnel id when the control plane supplies one so
+    // that subsequent stop/start dispatches from the backend (which key
+    // by backend id) resolve the same agent-side entry.
+    const backendTunnelId =
+      typeof req.metadata?.["backendTunnelId"] === "string"
+        ? (req.metadata["backendTunnelId"] as string)
+        : undefined;
+    const tunnelId = backendTunnelId ?? crypto.randomUUID();
     const sessionId = crypto.randomUUID();
     const localHost = req.localHost ?? "127.0.0.1";
     const protocol: TunnelProtocol = req.protocol;
