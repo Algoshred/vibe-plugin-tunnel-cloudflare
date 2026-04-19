@@ -738,8 +738,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
       `[tunnel-cloudflare] Starting agent tunnel on port ${agentPort}`,
     );
 
+    // Agent's Elysia HTTP server listens on plain http://; cloudflared does
+    // the TLS termination on its end. Was previously hardcoded to "https"
+    // which spawned `cloudflared tunnel --url https://localhost:3005` and
+    // every onboard call hit a 502 (no TLS server on the local port).
     const session = await this.issueSession({
-      protocol: "https",
+      protocol: "http",
       localPort: agentPort,
       localHost: "localhost",
       metadata: { isAgentTunnel: true, name: "agent" },
