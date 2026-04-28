@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-tunnel-cloudflare",
-  "version": "2026.411.1",
+  "version": "2026.428.1",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Cloudflare Tunnel provider for VibeControls Agent",
