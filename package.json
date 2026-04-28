@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-tunnel-cloudflare",
-  "version": "2026.428.1",
+  "version": "2026.428.3",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Cloudflare Tunnel provider for VibeControls Agent",
@@ -62,7 +62,7 @@
   },
   "homepage": "https://vibecontrols.com",
   "publishConfig": {
-    "access": "restricted",
+    "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
