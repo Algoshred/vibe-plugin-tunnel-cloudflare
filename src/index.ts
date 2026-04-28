@@ -132,8 +132,8 @@ interface HostServices {
   getAgentVersion(): string;
 }
 
-// Elysia and Command are opaque — we only need them for callback signatures.
-type Elysia = unknown;
+// Command is opaque — we only need it for callback signatures.
+type ElysiaApp = unknown;
 type Command = unknown;
 
 interface SessionProvider {
@@ -150,17 +150,25 @@ interface VibePlugin {
   cliCommand?: string;
   apiPrefix?: string;
   dependencies?: string[];
+  prerequisites?: Array<{
+    name: string;
+    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
+    requiresSudo: boolean;
+    description?: string;
+  }>;
   providers?: { tunnel?: TunnelProvider; session?: SessionProvider };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  createRoutes?: (deps?: unknown) => any;
   onCliSetup?: (
     program: Command,
     hostServices: HostServices,
   ) => void | Promise<void>;
   onServerStart?: (
-    app: Elysia,
+    app: ElysiaApp,
     hostServices: HostServices,
   ) => void | Promise<void>;
   onServerReady?: (
-    app: Elysia,
+    app: ElysiaApp,
     hostServices: HostServices,
   ) => void | Promise<void>;
   onServerStop?: () => void | Promise<void>;
@@ -804,17 +812,87 @@ class CloudflareTunnelProvider implements TunnelProvider {
 /** Singleton provider instance — initialised in onServerStart. */
 let provider: CloudflareTunnelProvider | null = null;
 
+// ---------------------------------------------------------------------------
+// Prereq protocol (see PLUGIN_DEVELOPMENT_GUIDE.md → Plugin Prerequisites)
+// ---------------------------------------------------------------------------
+
+import { Elysia } from "elysia";
+import { spawnSync } from "node:child_process";
+
+function whichSync(bin: string): string | null {
+  const r = spawnSync("which", [bin], { encoding: "utf8" });
+  if (r.status === 0) return r.stdout.trim() || null;
+  return null;
+}
+
+function createPrereqsRoutes() {
+  return new Elysia({ prefix: "/prereqs" })
+    .get("/status", () => {
+      const cf = whichSync("cloudflared");
+      return {
+        satisfied: !!cf,
+        missing: cf
+          ? []
+          : [
+              {
+                name: "cloudflared",
+                kind: "binary" as const,
+                requiresSudo: true,
+                detected: undefined,
+              },
+            ],
+      };
+    })
+    .post("/install", () => {
+      const cf = whichSync("cloudflared");
+      if (cf) return { ok: true, installed: [], pendingSudo: [], errors: [] };
+
+      const cmd =
+        process.platform === "darwin"
+          ? "brew install cloudflared"
+          : process.platform === "linux"
+            ? "curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && sudo chmod +x /usr/local/bin/cloudflared"
+            : "see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
+
+      return {
+        ok: true,
+        installed: [],
+        pendingSudo: [
+          {
+            name: "cloudflared",
+            command: cmd,
+            reason: "cloudflared is required to start tunnels.",
+          },
+        ],
+        errors: [],
+      };
+    })
+    .post("/uninstall", () => ({ ok: true }));
+}
+
 export const vibePlugin: VibePlugin = {
   name: "tunnel-cloudflare",
   version: "2.0.0",
   description: "Cloudflare Tunnel provider for remote access",
   tags: ["backend", "provider"],
+  apiPrefix: "/api/tunnel-cloudflare",
+
+  prerequisites: [
+    {
+      name: "cloudflared",
+      kind: "binary",
+      requiresSudo: true,
+      description: "Cloudflare tunnel daemon",
+    },
+  ],
 
   // The `tunnel` slot is populated at runtime during onServerStart.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   providers: { tunnel: undefined as any },
 
-  async onServerStart(_app: Elysia, hostServices: HostServices): Promise<void> {
+  createRoutes: () => createPrereqsRoutes(),
+
+  async onServerStart(_app: ElysiaApp, hostServices: HostServices): Promise<void> {
     const log = hostServices.logger;
 
     log.info("[tunnel-cloudflare] Plugin initialising");

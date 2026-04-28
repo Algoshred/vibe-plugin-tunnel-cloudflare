@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-tunnel-cloudflare",
-  "version": "2026.428.3",
+  "version": "2026.428.4",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Cloudflare Tunnel provider for VibeControls Agent",
@@ -25,7 +25,9 @@
     "prepublishOnly": "bun run build",
     "sanity": "bun run format:check && bun run lint && bun run type:check && bun run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "elysia": "^1.4.28"
+  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
