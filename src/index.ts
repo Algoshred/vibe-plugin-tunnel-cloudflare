@@ -892,7 +892,10 @@ export const vibePlugin: VibePlugin = {
 
   createRoutes: () => createPrereqsRoutes(),
 
-  async onServerStart(_app: ElysiaApp, hostServices: HostServices): Promise<void> {
+  async onServerStart(
+    _app: ElysiaApp,
+    hostServices: HostServices,
+  ): Promise<void> {
     const log = hostServices.logger;
 
     log.info("[tunnel-cloudflare] Plugin initialising");
