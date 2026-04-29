@@ -819,10 +819,15 @@ let provider: CloudflareTunnelProvider | null = null;
 import { Elysia } from "elysia";
 import { spawnSync } from "node:child_process";
 
+// Cross-platform binary discovery: `which` on POSIX, `where.exe` on Windows.
+// Both finders return a non-zero exit when the binary is missing.
 function whichSync(bin: string): string | null {
-  const r = spawnSync("which", [bin], { encoding: "utf8" });
-  if (r.status === 0) return r.stdout.trim() || null;
-  return null;
+  const finder = process.platform === "win32" ? "where.exe" : "which";
+  const r = spawnSync(finder, [bin], { encoding: "utf8" });
+  if (r.status !== 0) return null;
+  // `where.exe` returns one path per line; first one wins.
+  const first = r.stdout.toString().split(/\r?\n/)[0]?.trim();
+  return first || null;
 }
 
 function createPrereqsRoutes() {
