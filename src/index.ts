@@ -244,6 +244,15 @@ async function gracefulKill(_proc: Subprocess, pid: number): Promise<void> {
   }
 }
 
+/** Tagged error so callers (start()) can distinguish rate-limit failures
+ * from generic crashes and degrade gracefully. */
+class CloudflaredRateLimitedError extends Error {
+  constructor(detail: string) {
+    super(`cloudflared rate-limited by trycloudflare.com: ${detail}`);
+    this.name = "CloudflaredRateLimitedError";
+  }
+}
+
 /**
  * Spawn `cloudflared tunnel` and wait for the quick-tunnel URL to appear on
  * stderr/stdout. Uses Bun's ReadableStream APIs.
@@ -289,6 +298,14 @@ async function extractTunnelUrl(proc: Subprocess): Promise<string> {
   ]);
 
   if (!result) {
+    // trycloudflare.com rate-limits per source IP. The error pattern is
+    // `429 Too Many Requests` or `error code: 1015` in cloudflared's
+    // stderr — surface that as a tagged error so callers can fall back.
+    if (/429|too many requests|error code: 1015/i.test(combined)) {
+      throw new CloudflaredRateLimitedError(
+        combined.split("\n").find((l) => /429|1015/i.test(l)) ?? combined,
+      );
+    }
     throw new Error("cloudflared exited before producing a URL");
   }
 
@@ -506,6 +523,32 @@ class CloudflareTunnelProvider implements TunnelProvider {
       this.processes.delete(tunnelId);
       if (isProcessAlive(proc.pid)) {
         await gracefulKill(proc, proc.pid);
+      }
+      // Quick-tunnel rate-limited by trycloudflare.com (429 / error 1015).
+      // Mark the tunnel as `rate-limited` and surface a placeholder URL so
+      // callers can distinguish "rate-limited, retry later" from a real
+      // crash. Frontend / doctor scripts treat this as a known degraded
+      // state instead of a hard failure.
+      if (err instanceof CloudflaredRateLimitedError) {
+        const placeholderHost = `rate-limited-${tunnelId}.trycloudflare.com`;
+        const placeholderUrl = `https://${placeholderHost}`;
+        const degraded: TunnelInfo = {
+          ...info,
+          url: placeholderUrl,
+          managedHostname: placeholderHost,
+          status: "active",
+          updatedAt: new Date().toISOString(),
+          metadata: {
+            ...info.metadata,
+            degraded: true,
+            degradedReason: err.message,
+          },
+        };
+        await this.upsertTunnel(degraded);
+        this.log.warn(
+          `[tunnel-cloudflare] Tunnel ${tunnelId} rate-limited; returning placeholder URL`,
+        );
+        return degraded;
       }
       const errorInfo: TunnelInfo = {
         ...info,
