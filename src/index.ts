@@ -139,6 +139,9 @@ interface ServiceRegistry {
 }
 
 interface HostServices {
+  telemetry?: {
+    emit: (name: string, payload?: Record<string, unknown>) => void;
+  };
   storage: StorageProvider;
   logger: Logger;
   serviceRegistry: ServiceRegistry;
@@ -155,7 +158,18 @@ interface SessionProvider {
   [key: string]: unknown;
 }
 
+interface PluginCapabilities {
+  storage?: "none" | "read" | "rw";
+  secrets?: "none" | "read" | "rw";
+  gateway?: boolean;
+  broadcast?: boolean;
+  subprocess?: boolean;
+  audit?: boolean;
+  telemetry?: boolean;
+}
+
 interface VibePlugin {
+  capabilities?: PluginCapabilities;
   name: string;
   version: string;
   description?: string;
@@ -1008,6 +1022,11 @@ function createPrereqsRoutes() {
 }
 
 export const vibePlugin: VibePlugin = {
+  capabilities: {
+    storage: "rw",
+    subprocess: true,
+    telemetry: true,
+  },
   name: "tunnel-cloudflare",
   version: "2.0.0",
   description: "Cloudflare Tunnel provider for remote access",
@@ -1033,6 +1052,7 @@ export const vibePlugin: VibePlugin = {
     _app: ElysiaApp,
     hostServices: HostServices,
   ): Promise<void> {
+    hostServices?.telemetry?.emit("tunnel.provider.ready", { provider: "cloudflare" });
     const log = hostServices.logger;
 
     log.info("[tunnel-cloudflare] Plugin initialising");
