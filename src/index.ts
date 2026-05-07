@@ -771,18 +771,18 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // bootstrap's URL from the banner — pointing at a dead process by
     // the time they paste it into the platform UI.
     //
-    // Per-agent isolation: prefer the port-suffixed env keys (set by
-    // tunnel-bootstrap with the agent's listening port) so two agents
-    // running concurrently never adopt each other's bootstrap. Fall back
-    // to the unsuffixed keys for backward-compat with older agent
-    // versions that didn't suffix.
-    const portSuffix = String(agentPort);
-    const envBootstrapPid =
-      process.env[`AGENT_TUNNEL_PID_${portSuffix}`] ??
-      process.env.AGENT_TUNNEL_PID;
-    const envBootstrapUrl =
-      process.env[`AGENT_TUNNEL_URL_${portSuffix}`] ??
-      process.env.AGENT_TUNNEL_URL;
+    // Per-agent isolation: ONLY honour the env keys suffixed with this
+    // agent instance's id (VIBECONTROLS_AGENT_ID — same handle that
+    // scopes on-disk state via path-utils). The unsuffixed keys are
+    // deliberately ignored here so two agents running concurrently in
+    // the same process tree (or a future flow that forks plugins
+    // inheriting parent env) can never adopt each other's bootstrap.
+    // The unsuffixed AGENT_TUNNEL_URL is reserved for operator-pinned
+    // external-tunnel mode handled elsewhere.
+    const agentId = process.env.VIBECONTROLS_AGENT_ID || "default";
+    const idSuffix = agentId.replace(/[^A-Za-z0-9_]/g, "_");
+    const envBootstrapPid = process.env[`AGENT_TUNNEL_PID_${idSuffix}`];
+    const envBootstrapUrl = process.env[`AGENT_TUNNEL_URL_${idSuffix}`];
     if (envBootstrapPid && envBootstrapUrl) {
       const pid = parseInt(envBootstrapPid, 10);
       if (!isNaN(pid) && isProcessAlive(pid)) {
@@ -806,13 +806,13 @@ class CloudflareTunnelProvider implements TunnelProvider {
           createdAt: new Date().toISOString(),
           metadata: { isAgentTunnel: true, name: "agent", adopted: true },
         };
-        // Clear BOTH the per-port and unsuffixed env hand-off keys so a
-        // later restart of startAgentTunnel doesn't try to adopt a
-        // now-dead PID that already lives in our own storage.
-        delete process.env[`AGENT_TUNNEL_PID_${portSuffix}`];
-        delete process.env[`AGENT_TUNNEL_URL_${portSuffix}`];
-        delete process.env.AGENT_TUNNEL_PID;
-        delete process.env.AGENT_TUNNEL_URL;
+        // Clear the per-agent-id hand-off keys so a later restart of
+        // startAgentTunnel in the same process doesn't try to re-adopt
+        // a PID that already lives in our own storage. We do NOT touch
+        // the unsuffixed AGENT_TUNNEL_URL because that's the operator-
+        // pinned external-tunnel mode and we shouldn't trample it.
+        delete process.env[`AGENT_TUNNEL_PID_${idSuffix}`];
+        delete process.env[`AGENT_TUNNEL_URL_${idSuffix}`];
         return adopted;
       }
     }
