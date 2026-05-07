@@ -772,17 +772,17 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // the time they paste it into the platform UI.
     //
     // Per-agent isolation: ONLY honour the env keys suffixed with this
-    // agent instance's id (VIBECONTROLS_AGENT_ID — same handle that
+    // agent instance's profile (VIBECONTROLS_PROFILE — same handle that
     // scopes on-disk state via path-utils). The unsuffixed keys are
     // deliberately ignored here so two agents running concurrently in
     // the same process tree (or a future flow that forks plugins
     // inheriting parent env) can never adopt each other's bootstrap.
     // The unsuffixed AGENT_TUNNEL_URL is reserved for operator-pinned
     // external-tunnel mode handled elsewhere.
-    const agentId = process.env.VIBECONTROLS_AGENT_ID || "default";
-    const idSuffix = agentId.replace(/[^A-Za-z0-9_]/g, "_");
-    const envBootstrapPid = process.env[`AGENT_TUNNEL_PID_${idSuffix}`];
-    const envBootstrapUrl = process.env[`AGENT_TUNNEL_URL_${idSuffix}`];
+    const profile = process.env.VIBECONTROLS_PROFILE ?? "default";
+    const profileSuffix = profile.replace(/[^A-Za-z0-9_]/g, "_");
+    const envBootstrapPid = process.env[`AGENT_TUNNEL_PID_${profileSuffix}`];
+    const envBootstrapUrl = process.env[`AGENT_TUNNEL_URL_${profileSuffix}`];
     if (envBootstrapPid && envBootstrapUrl) {
       const pid = parseInt(envBootstrapPid, 10);
       if (!isNaN(pid) && isProcessAlive(pid)) {
@@ -811,8 +811,8 @@ class CloudflareTunnelProvider implements TunnelProvider {
         // a PID that already lives in our own storage. We do NOT touch
         // the unsuffixed AGENT_TUNNEL_URL because that's the operator-
         // pinned external-tunnel mode and we shouldn't trample it.
-        delete process.env[`AGENT_TUNNEL_PID_${idSuffix}`];
-        delete process.env[`AGENT_TUNNEL_URL_${idSuffix}`];
+        delete process.env[`AGENT_TUNNEL_PID_${profileSuffix}`];
+        delete process.env[`AGENT_TUNNEL_URL_${profileSuffix}`];
         return adopted;
       }
     }
