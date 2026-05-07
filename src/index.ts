@@ -762,6 +762,48 @@ class CloudflareTunnelProvider implements TunnelProvider {
    * spawning a new one. This keeps the tunnel URL stable across hot-reloads.
    */
   async startAgentTunnel(agentPort: number): Promise<TunnelInfo> {
+    // Adopt the bootstrap cloudflared if one is alive. The agent's
+    // pre-config phase (src/core/tunnel-bootstrap.ts) spawns cloudflared
+    // BEFORE finalize so the banner can print a tunnel URL. Without this
+    // adopt step, the plugin would spawn a SECOND cloudflared (with a
+    // different URL) at finalize-time, the bootstrap cloudflared would
+    // get SIGTERMed seconds later, and the user would have copied the
+    // bootstrap's URL from the banner — pointing at a dead process by
+    // the time they paste it into the platform UI.
+    const envBootstrapPid = process.env.AGENT_TUNNEL_PID;
+    const envBootstrapUrl = process.env.AGENT_TUNNEL_URL;
+    if (envBootstrapPid && envBootstrapUrl) {
+      const pid = parseInt(envBootstrapPid, 10);
+      if (!isNaN(pid) && isProcessAlive(pid)) {
+        this.log.info(
+          `[tunnel-cloudflare] Adopting bootstrap cloudflared (pid=${pid}) at ${envBootstrapUrl}`,
+        );
+        // Persist into our own storage so subsequent restarts (within the
+        // same boot) reuse via the existing storage path and so list() /
+        // stop() see the process correctly.
+        await this.storage.set(STORAGE_NS, KEY_AGENT_URL, envBootstrapUrl);
+        await this.storage.set(STORAGE_NS, KEY_AGENT_PID, String(pid));
+        const adopted: TunnelInfo = {
+          id: `agent-bootstrap-${pid}`,
+          providerName: "cloudflare",
+          status: "active",
+          protocol: "http",
+          localPort: agentPort,
+          localHost: "localhost",
+          url: envBootstrapUrl,
+          pid,
+          createdAt: new Date().toISOString(),
+          metadata: { isAgentTunnel: true, name: "agent", adopted: true },
+        };
+        // Clear env hand-off keys so a later (post-handover) restart of the
+        // plugin's startAgentTunnel doesn't try to adopt a now-dead PID
+        // that already lives in our own storage.
+        delete process.env.AGENT_TUNNEL_PID;
+        delete process.env.AGENT_TUNNEL_URL;
+        return adopted;
+      }
+    }
+
     // Reuse existing tunnel if the process is still alive.
     const storedPidStr = await this.storage.get(STORAGE_NS, KEY_AGENT_PID);
     const storedUrl = await this.storage.get(STORAGE_NS, KEY_AGENT_URL);
@@ -782,6 +824,20 @@ class CloudflareTunnelProvider implements TunnelProvider {
           // We don't have the Subprocess handle, but PID-based kill still works.
           return existing;
         }
+        // No matching TunnelInfo (storage state never primed by us) — synth
+        // one so adopt-by-PID still produces a usable record.
+        return {
+          id: `agent-stored-${storedPid}`,
+          providerName: "cloudflare",
+          status: "active",
+          protocol: "http",
+          localPort: agentPort,
+          localHost: "localhost",
+          url: storedUrl,
+          pid: storedPid,
+          createdAt: new Date().toISOString(),
+          metadata: { isAgentTunnel: true, name: "agent", adopted: true },
+        };
       }
     }
 
