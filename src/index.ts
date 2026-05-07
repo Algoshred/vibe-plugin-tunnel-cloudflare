@@ -13,6 +13,21 @@
 
 import type { Subprocess } from "bun";
 
+/**
+ * Resolve the cloudflared binary path with the platform-correct extension.
+ * `Bun.which` searches PATH and on Windows handles the .exe suffix
+ * implicitly; falling back to the bare name lets the OS error give a
+ * sensible "command not found" instead of us silently passing nothing.
+ */
+function resolveCloudflaredCmd(): string {
+  const bare =
+    typeof Bun !== "undefined" && typeof Bun.which === "function"
+      ? Bun.which("cloudflared")
+      : null;
+  if (bare) return bare;
+  return process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+}
+
 // ---------------------------------------------------------------------------
 // Types — locally defined to avoid hard dependency on @vibecontrols/agent.
 // These mirror the canonical interfaces from the core agent package.
@@ -476,11 +491,14 @@ class CloudflareTunnelProvider implements TunnelProvider {
       `[tunnel-cloudflare] Starting tunnel ${tunnelId} → ${localUrl}`,
     );
 
-    const proc = Bun.spawn(["cloudflared", "tunnel", "--url", localUrl], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = Bun.spawn(
+      [resolveCloudflaredCmd(), "tunnel", "--url", localUrl],
+      {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     this.processes.set(tunnelId, proc);
 
     void proc.exited.then((code) => {
@@ -728,7 +746,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const result = Bun.spawnSync(["cloudflared", "--version"], {
+      const result = Bun.spawnSync([resolveCloudflaredCmd(), "--version"], {
         stdout: "pipe",
         stderr: "pipe",
         timeout: 10_000,
@@ -969,7 +987,9 @@ function createPrereqsRoutes() {
           ? "brew install cloudflared"
           : process.platform === "linux"
             ? "curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && sudo chmod +x /usr/local/bin/cloudflared"
-            : "see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
+            : process.platform === "win32"
+              ? "winget install Cloudflare.cloudflared    # or: scoop install cloudflared    # or download from https://github.com/cloudflare/cloudflared/releases"
+              : "see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
 
       return {
         ok: true,
