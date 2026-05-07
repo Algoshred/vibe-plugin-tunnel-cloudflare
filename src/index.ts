@@ -806,7 +806,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
           createdAt: new Date().toISOString(),
           metadata: { isAgentTunnel: true, name: "agent", adopted: true },
         };
-        // Clear the per-agent-id hand-off keys so a later restart of
+        // Clear the per-profile hand-off keys so a later restart of
         // startAgentTunnel in the same process doesn't try to re-adopt
         // a PID that already lives in our own storage. We do NOT touch
         // the unsuffixed AGENT_TUNNEL_URL because that's the operator-
