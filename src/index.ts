@@ -770,8 +770,19 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // get SIGTERMed seconds later, and the user would have copied the
     // bootstrap's URL from the banner — pointing at a dead process by
     // the time they paste it into the platform UI.
-    const envBootstrapPid = process.env.AGENT_TUNNEL_PID;
-    const envBootstrapUrl = process.env.AGENT_TUNNEL_URL;
+    //
+    // Per-agent isolation: prefer the port-suffixed env keys (set by
+    // tunnel-bootstrap with the agent's listening port) so two agents
+    // running concurrently never adopt each other's bootstrap. Fall back
+    // to the unsuffixed keys for backward-compat with older agent
+    // versions that didn't suffix.
+    const portSuffix = String(agentPort);
+    const envBootstrapPid =
+      process.env[`AGENT_TUNNEL_PID_${portSuffix}`] ??
+      process.env.AGENT_TUNNEL_PID;
+    const envBootstrapUrl =
+      process.env[`AGENT_TUNNEL_URL_${portSuffix}`] ??
+      process.env.AGENT_TUNNEL_URL;
     if (envBootstrapPid && envBootstrapUrl) {
       const pid = parseInt(envBootstrapPid, 10);
       if (!isNaN(pid) && isProcessAlive(pid)) {
@@ -795,9 +806,11 @@ class CloudflareTunnelProvider implements TunnelProvider {
           createdAt: new Date().toISOString(),
           metadata: { isAgentTunnel: true, name: "agent", adopted: true },
         };
-        // Clear env hand-off keys so a later (post-handover) restart of the
-        // plugin's startAgentTunnel doesn't try to adopt a now-dead PID
-        // that already lives in our own storage.
+        // Clear BOTH the per-port and unsuffixed env hand-off keys so a
+        // later restart of startAgentTunnel doesn't try to adopt a
+        // now-dead PID that already lives in our own storage.
+        delete process.env[`AGENT_TUNNEL_PID_${portSuffix}`];
+        delete process.env[`AGENT_TUNNEL_URL_${portSuffix}`];
         delete process.env.AGENT_TUNNEL_PID;
         delete process.env.AGENT_TUNNEL_URL;
         return adopted;
