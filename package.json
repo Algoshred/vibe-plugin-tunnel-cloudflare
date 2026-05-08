@@ -1,6 +1,6 @@
 {
   "name": "@vibecontrols/vibe-plugin-tunnel-cloudflare",
-  "version": "2026.508.3",
+  "version": "2026.508.4",
   "type": "module",
   "main": "./dist/index.js",
   "description": "Cloudflare Tunnel provider for VibeControls Agent",
@@ -42,7 +42,7 @@
   },
   "peerDependencies": {
     "@vibecontrols/agent": "2026.428.5",
-    "@vibecontrols/vibe-plugin-tunnel": "^2026.429.2"
+    "@vibecontrols/vibe-plugin-tunnel": "2026.508.3"
   },
   "peerDependenciesMeta": {
     "@vibecontrols/agent": {
