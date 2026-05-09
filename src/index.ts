@@ -1,5 +1,5 @@
 /**
- * @burdenoff/vibe-plugin-tunnel-cloudflare
+ * @vibecontrols/vibe-plugin-tunnel-cloudflare
  *
  * Cloudflare Tunnel provider plugin for VibeControls Agent.
  * Spawns `cloudflared tunnel --url` processes to expose local ports via
@@ -9,9 +9,36 @@
  *   - "tunnels"          → JSON array of TunnelInfo records
  *   - "agent-tunnel-url" → string | null (the main agent tunnel URL)
  *   - "agent-tunnel-pid" → string (PID of the agent tunnel process)
+ *
+ * Migrated to consume `@vibecontrols/plugin-sdk` for the contract,
+ * lifecycle, telemetry, logger and subprocess helpers.
  */
 
 import type { Subprocess } from "bun";
+import { Elysia } from "elysia";
+
+import {
+  BoundLogger,
+  createLifecycleHooks,
+  gracefulKill as sdkGracefulKill,
+  isProcessAlive,
+  ProviderRegistry,
+  TelemetryEmitter,
+} from "@vibecontrols/plugin-sdk";
+import type {
+  HostServices,
+  VibePlugin,
+} from "@vibecontrols/plugin-sdk/contract";
+
+import type {
+  AgentStorageProvider,
+  IssueSessionRequest,
+  TunnelInfo,
+  TunnelProtocol,
+  TunnelProvider,
+  TunnelProviderCapabilities,
+  TunnelSessionInfo,
+} from "./types.js";
 
 /**
  * Resolve the cloudflared binary path with the platform-correct extension.
@@ -29,184 +56,11 @@ function resolveCloudflaredCmd(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Types — locally defined to avoid hard dependency on @vibecontrols/agent.
-// These mirror the canonical interfaces from the core agent package.
-// ---------------------------------------------------------------------------
-
-type TunnelStatus = "starting" | "active" | "stopping" | "stopped" | "error";
-type TunnelProtocol = "http" | "https" | "tcp" | "udp";
-
-interface TunnelProviderCapabilities {
-  provider: string;
-  supportsHttp: boolean;
-  supportsHttps: boolean;
-  supportsTcp: boolean;
-  supportsUdp: boolean;
-  supportsCustomDomains: boolean;
-  supportsManagedSubdomains: boolean;
-  supportsSessionTokens: boolean;
-  supportsLiveLogs: boolean;
-  supportsUsageMetrics: boolean;
-  supportsRotateCredentials: boolean;
-  platforms: string[];
-}
-
-interface IssueSessionRequest {
-  protocol: TunnelProtocol;
-  localPort: number;
-  localHost?: string;
-  subdomain?: string;
-  customDomain?: string;
-  ttlSeconds?: number;
-  metadata?: Record<string, unknown>;
-  controlPlanePayload?: Record<string, unknown>;
-}
-
-interface TunnelSessionInfo {
-  sessionId: string;
-  tunnelId: string;
-  provider: string;
-  managedHostname?: string;
-  customDomains?: string[];
-  expiresAt?: string;
-  credentials: Record<string, unknown>;
-}
-
-interface TunnelMetrics {
-  bytesIn: number;
-  bytesOut: number;
-  connections: number;
-  lastActivityAt?: string;
-}
-
-interface TunnelInfo {
-  id: string;
-  providerName: string;
-  status: TunnelStatus;
-  protocol: TunnelProtocol;
-  localPort: number;
-  localHost: string;
-  url: string;
-  managedHostname?: string;
-  customDomains?: string[];
-  sessionId?: string;
-  shardId?: string;
-  pid?: number;
-  createdAt: string;
-  updatedAt?: string;
-  metrics?: TunnelMetrics;
-  metadata?: Record<string, unknown>;
-}
-
-interface TunnelProvider {
-  readonly name: string;
-  getCapabilities(): TunnelProviderCapabilities;
-  healthCheck(): Promise<{
-    ok: boolean;
-    message?: string;
-    details?: Record<string, unknown>;
-  }>;
-  issueSession(req: IssueSessionRequest): Promise<TunnelSessionInfo>;
-  start(tunnelId: string): Promise<TunnelInfo>;
-  stop(tunnelId: string): Promise<void>;
-  delete(tunnelId: string): Promise<void>;
-  rotate(tunnelId: string): Promise<TunnelSessionInfo>;
-  getStatus(tunnelId: string): Promise<TunnelInfo | null>;
-  list(): Promise<TunnelInfo[]>;
-  attachCustomDomain(tunnelId: string, domain: string): Promise<void>;
-  detachCustomDomain(tunnelId: string, domain: string): Promise<void>;
-  listSessions(tunnelId: string): Promise<TunnelSessionInfo[]>;
-  getActiveTunnelUrl?(): Promise<string | null>;
-}
-
-interface StorageProvider {
-  get(namespace: string, key: string): Promise<string | null>;
-  set(namespace: string, key: string, value: string): Promise<void>;
-  delete(namespace: string, key: string): Promise<void>;
-  list(namespace: string): Promise<string[]>;
-  deleteAll(namespace: string): Promise<void>;
-}
-
-interface Logger {
-  debug(message: string, ...args: unknown[]): void;
-  info(message: string, ...args: unknown[]): void;
-  warn(message: string, ...args: unknown[]): void;
-  error(message: string, ...args: unknown[]): void;
-}
-
-interface ServiceRegistry {
-  [key: string]: unknown;
-}
-
-interface HostServices {
-  telemetry?: {
-    emit: (name: string, payload?: Record<string, unknown>) => void;
-  };
-  storage: StorageProvider;
-  logger: Logger;
-  serviceRegistry: ServiceRegistry;
-  getProvider<T>(type: "tunnel" | "session"): T | undefined;
-  getAgentBaseUrl(): string;
-  getAgentVersion(): string;
-}
-
-// Command is opaque — we only need it for callback signatures.
-type ElysiaApp = unknown;
-type Command = unknown;
-
-interface SessionProvider {
-  [key: string]: unknown;
-}
-
-interface PluginCapabilities {
-  storage?: "none" | "read" | "rw";
-  secrets?: "none" | "read" | "rw";
-  gateway?: boolean;
-  broadcast?: boolean;
-  subprocess?: boolean;
-  audit?: boolean;
-  telemetry?: boolean;
-}
-
-interface VibePlugin {
-  capabilities?: PluginCapabilities;
-  name: string;
-  version: string;
-  description?: string;
-  tags?: Array<
-    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
-  >;
-  cliCommand?: string;
-  apiPrefix?: string;
-  dependencies?: string[];
-  prerequisites?: Array<{
-    name: string;
-    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
-    requiresSudo: boolean;
-    description?: string;
-  }>;
-  providers?: { tunnel?: TunnelProvider; session?: SessionProvider };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  createRoutes?: (deps?: unknown) => any;
-  onCliSetup?: (
-    program: Command,
-    hostServices: HostServices,
-  ) => void | Promise<void>;
-  onServerStart?: (
-    app: ElysiaApp,
-    hostServices: HostServices,
-  ) => void | Promise<void>;
-  onServerReady?: (
-    app: ElysiaApp,
-    hostServices: HostServices,
-  ) => void | Promise<void>;
-  onServerStop?: () => void | Promise<void>;
-}
-
-// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
+const PLUGIN_NAME = "tunnel-cloudflare";
+const PLUGIN_VERSION = "2026.509.2";
 const PROVIDER_NAME = "tunnel-cloudflare";
 const STORAGE_NS = "tunnel-cloudflare";
 
@@ -230,48 +84,6 @@ const KILL_GRACE_MS = 3_000;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Returns `true` if a process with the given PID is still running.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    // Sending signal 0 doesn't kill the process — it just checks existence.
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Gracefully terminate a process: SIGTERM first, then SIGKILL after a timeout.
- */
-async function gracefulKill(_proc: Subprocess, pid: number): Promise<void> {
-  // Already dead — nothing to do.
-  if (!isProcessAlive(pid)) return;
-
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return;
-  }
-
-  const deadline = Date.now() + KILL_GRACE_MS;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 200));
-    if (!isProcessAlive(pid)) return;
-  }
-
-  // Force kill if still alive.
-  if (isProcessAlive(pid)) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone — ignore.
-    }
-  }
-}
 
 /** Tagged error so callers (start()) can distinguish rate-limit failures
  * from generic crashes and degrade gracefully. */
@@ -351,12 +163,17 @@ class CloudflareTunnelProvider implements TunnelProvider {
   /** In-memory map of tunnel ID → spawned Subprocess. */
   private readonly processes = new Map<string, Subprocess>();
 
-  private readonly storage: StorageProvider;
-  private readonly log: Logger;
+  private readonly storage: AgentStorageProvider;
+  private readonly log: BoundLogger;
+  private readonly hostServices: HostServices;
 
-  constructor(private readonly hostServices: HostServices) {
-    this.storage = hostServices.storage;
-    this.log = hostServices.logger;
+  constructor(hostServices: HostServices) {
+    this.hostServices = hostServices;
+    // The agent's runtime storage surface is richer than the SDK's neutral
+    // StorageProvider (delete returns void; deleteAll sweeper). Narrow via
+    // a single structural cast at the boundary.
+    this.storage = hostServices.storage as unknown as AgentStorageProvider;
+    this.log = new BoundLogger(hostServices.logger, PROVIDER_NAME);
   }
 
   // -----------------------------------------------------------------------
@@ -370,9 +187,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
     try {
       return JSON.parse(raw) as TunnelInfo[];
     } catch {
-      this.log.warn(
-        "[tunnel-cloudflare] Corrupt tunnel list in storage — resetting",
-      );
+      this.log.warn("Corrupt tunnel list in storage — resetting");
       return [];
     }
   }
@@ -501,9 +316,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
       updatedAt: new Date().toISOString(),
     });
 
-    this.log.info(
-      `[tunnel-cloudflare] Starting tunnel ${tunnelId} → ${localUrl}`,
-    );
+    this.log.info(`Starting tunnel ${tunnelId} → ${localUrl}`);
 
     const proc = Bun.spawn(
       [resolveCloudflaredCmd(), "tunnel", "--url", localUrl],
@@ -518,7 +331,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
     void proc.exited.then((code) => {
       if (this.processes.has(tunnelId)) {
         this.log.warn(
-          `[tunnel-cloudflare] Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
+          `Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
         );
         this.processes.delete(tunnelId);
         void this.loadTunnels().then((current) => {
@@ -547,14 +360,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
         updatedAt: new Date().toISOString(),
       };
       await this.upsertTunnel(activeInfo);
-      this.log.info(
-        `[tunnel-cloudflare] Tunnel ${tunnelId} active at ${url} (PID ${proc.pid})`,
-      );
+      this.log.info(`Tunnel ${tunnelId} active at ${url} (PID ${proc.pid})`);
       return activeInfo;
     } catch (err) {
       this.processes.delete(tunnelId);
       if (isProcessAlive(proc.pid)) {
-        await gracefulKill(proc, proc.pid);
+        await sdkGracefulKill(proc.pid, KILL_GRACE_MS);
       }
       // Quick-tunnel rate-limited by trycloudflare.com (429 / error 1015).
       // Mark the tunnel as `rate-limited` and surface a placeholder URL so
@@ -578,7 +389,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
         };
         await this.upsertTunnel(degraded);
         this.log.warn(
-          `[tunnel-cloudflare] Tunnel ${tunnelId} rate-limited; returning placeholder URL`,
+          `Tunnel ${tunnelId} rate-limited; returning placeholder URL`,
         );
         return degraded;
       }
@@ -640,7 +451,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   async stop(tunnelId: string): Promise<void> {
-    this.log.info(`[tunnel-cloudflare] Stopping tunnel ${tunnelId}`);
+    this.log.info(`Stopping tunnel ${tunnelId}`);
 
     const tunnels = await this.loadTunnels();
     const tunnel = tunnels.find((t) => t.id === tunnelId);
@@ -655,28 +466,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Kill the in-memory process if we still have a handle.
     const proc = this.processes.get(tunnelId);
     if (proc) {
-      await gracefulKill(proc, proc.pid);
+      await sdkGracefulKill(proc.pid, KILL_GRACE_MS);
       this.processes.delete(tunnelId);
     } else if (tunnel?.pid && isProcessAlive(tunnel.pid)) {
       // Fallback: we lost the ChildProcess handle but the PID is still alive
       // (e.g. after an agent restart). Kill directly by PID.
-      try {
-        process.kill(tunnel.pid, "SIGTERM");
-        await new Promise<void>((resolve) => {
-          setTimeout(() => {
-            if (tunnel.pid && isProcessAlive(tunnel.pid)) {
-              try {
-                process.kill(tunnel.pid, "SIGKILL");
-              } catch {
-                // Already gone.
-              }
-            }
-            resolve();
-          }, KILL_GRACE_MS);
-        });
-      } catch {
-        // Process already gone — no action needed.
-      }
+      await sdkGracefulKill(tunnel.pid, KILL_GRACE_MS);
     }
 
     // Mark as stopped in storage.
@@ -694,7 +489,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
       await this.storage.delete(STORAGE_NS, KEY_AGENT_PID);
     }
 
-    this.log.info(`[tunnel-cloudflare] Tunnel ${tunnelId} stopped`);
+    this.log.info(`Tunnel ${tunnelId} stopped`);
   }
 
   async getStatus(tunnelId: string): Promise<TunnelInfo | null> {
@@ -727,7 +522,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   async delete(tunnelId: string): Promise<void> {
-    this.log.info(`[tunnel-cloudflare] Deleting tunnel ${tunnelId}`);
+    this.log.info(`Deleting tunnel ${tunnelId}`);
 
     // Stop the process if it's still running.
     const tunnels = await this.loadTunnels();
@@ -743,7 +538,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Remove the record entirely from storage.
     await this.removeTunnelRecord(tunnelId);
 
-    this.log.info(`[tunnel-cloudflare] Tunnel ${tunnelId} deleted`);
+    this.log.info(`Tunnel ${tunnelId} deleted`);
   }
 
   /**
@@ -752,9 +547,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
    * Storage is preserved so the next startAgentTunnel can reconnect.
    */
   detachAll(): void {
-    this.log.info(
-      "[tunnel-cloudflare] Detaching from all tunnels (processes left running)",
-    );
+    this.log.info("Detaching from all tunnels (processes left running)");
     this.processes.clear();
   }
 
@@ -796,21 +589,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
   async startAgentTunnel(agentPort: number): Promise<TunnelInfo> {
     // Adopt the bootstrap cloudflared if one is alive. The agent's
     // pre-config phase (src/core/tunnel-bootstrap.ts) spawns cloudflared
-    // BEFORE finalize so the banner can print a tunnel URL. Without this
-    // adopt step, the plugin would spawn a SECOND cloudflared (with a
-    // different URL) at finalize-time, the bootstrap cloudflared would
-    // get SIGTERMed seconds later, and the user would have copied the
-    // bootstrap's URL from the banner — pointing at a dead process by
-    // the time they paste it into the platform UI.
-    //
-    // Per-agent isolation: ONLY honour the env keys suffixed with this
-    // agent instance's profile (VIBECONTROLS_PROFILE — same handle that
-    // scopes on-disk state via path-utils). The unsuffixed keys are
-    // deliberately ignored here so two agents running concurrently in
-    // the same process tree (or a future flow that forks plugins
-    // inheriting parent env) can never adopt each other's bootstrap.
-    // The unsuffixed AGENT_TUNNEL_URL is reserved for operator-pinned
-    // external-tunnel mode handled elsewhere.
+    // BEFORE finalize so the banner can print a tunnel URL.
     const profile = process.env.VIBECONTROLS_PROFILE ?? "default";
     const profileSuffix = profile.replace(/[^A-Za-z0-9_]/g, "_");
     const envBootstrapPid = process.env[`AGENT_TUNNEL_PID_${profileSuffix}`];
@@ -819,11 +598,8 @@ class CloudflareTunnelProvider implements TunnelProvider {
       const pid = parseInt(envBootstrapPid, 10);
       if (!isNaN(pid) && isProcessAlive(pid)) {
         this.log.info(
-          `[tunnel-cloudflare] Adopting bootstrap cloudflared (pid=${pid}) at ${envBootstrapUrl}`,
+          `Adopting bootstrap cloudflared (pid=${pid}) at ${envBootstrapUrl}`,
         );
-        // Persist into our own storage so subsequent restarts (within the
-        // same boot) reuse via the existing storage path and so list() /
-        // stop() see the process correctly.
         await this.storage.set(STORAGE_NS, KEY_AGENT_URL, envBootstrapUrl);
         await this.storage.set(STORAGE_NS, KEY_AGENT_PID, String(pid));
         const adopted: TunnelInfo = {
@@ -838,11 +614,6 @@ class CloudflareTunnelProvider implements TunnelProvider {
           createdAt: new Date().toISOString(),
           metadata: { isAgentTunnel: true, name: "agent", adopted: true },
         };
-        // Clear the per-profile hand-off keys so a later restart of
-        // startAgentTunnel in the same process doesn't try to re-adopt
-        // a PID that already lives in our own storage. We do NOT touch
-        // the unsuffixed AGENT_TUNNEL_URL because that's the operator-
-        // pinned external-tunnel mode and we shouldn't trample it.
         delete process.env[`AGENT_TUNNEL_PID_${profileSuffix}`];
         delete process.env[`AGENT_TUNNEL_URL_${profileSuffix}`];
         return adopted;
@@ -857,20 +628,15 @@ class CloudflareTunnelProvider implements TunnelProvider {
       const storedPid = parseInt(storedPidStr, 10);
       if (!isNaN(storedPid) && isProcessAlive(storedPid)) {
         this.log.info(
-          `[tunnel-cloudflare] Reusing existing agent tunnel (pid=${storedPid}) at ${storedUrl}`,
+          `Reusing existing agent tunnel (pid=${storedPid}) at ${storedUrl}`,
         );
-        // Reconstruct a TunnelInfo so callers get consistent data.
         const tunnels = await this.loadTunnels();
         const existing = tunnels.find(
-          (t) => t.pid === storedPid && t.metadata?.isAgentTunnel,
+          (t) => t.pid === storedPid && t.metadata?.["isAgentTunnel"],
         );
         if (existing) {
-          // Re-register in-memory so stop()/list() work correctly.
-          // We don't have the Subprocess handle, but PID-based kill still works.
           return existing;
         }
-        // No matching TunnelInfo (storage state never primed by us) — synth
-        // one so adopt-by-PID still produces a usable record.
         return {
           id: `agent-stored-${storedPid}`,
           providerName: "cloudflare",
@@ -886,14 +652,8 @@ class CloudflareTunnelProvider implements TunnelProvider {
       }
     }
 
-    this.log.info(
-      `[tunnel-cloudflare] Starting agent tunnel on port ${agentPort}`,
-    );
+    this.log.info(`Starting agent tunnel on port ${agentPort}`);
 
-    // Agent's Elysia HTTP server listens on plain http://; cloudflared does
-    // the TLS termination on its end. Was previously hardcoded to "https"
-    // which spawned `cloudflared tunnel --url https://localhost:3005` and
-    // every onboard call hit a 502 (no TLS server on the local port).
     const session = await this.issueSession({
       protocol: "http",
       localPort: agentPort,
@@ -902,13 +662,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
     });
     const info = await this.start(session.tunnelId);
 
-    // Persist agent-specific keys for quick lookup.
     await this.storage.set(STORAGE_NS, KEY_AGENT_URL, info.url);
     if (info.pid !== undefined) {
       await this.storage.set(STORAGE_NS, KEY_AGENT_PID, String(info.pid));
     }
 
-    this.log.info(`[tunnel-cloudflare] Agent tunnel active at ${info.url}`);
+    this.log.info(`Agent tunnel active at ${info.url}`);
 
     return info;
   }
@@ -917,35 +676,27 @@ class CloudflareTunnelProvider implements TunnelProvider {
    * Tear down every tunnel this provider is tracking and clear storage.
    */
   async stopAll(): Promise<void> {
-    this.log.info("[tunnel-cloudflare] Stopping all tunnels");
+    this.log.info("Stopping all tunnels");
 
     const tunnels = await this.loadTunnels();
 
-    // Stop all active/starting tunnels in parallel.
     await Promise.allSettled(
       tunnels
         .filter((t) => t.status === "active" || t.status === "starting")
         .map((t) => this.stop(t.id)),
     );
 
-    // Kill any lingering in-memory processes that weren't in the persisted
-    // list (defensive — shouldn't normally happen).
     for (const [id, proc] of this.processes) {
       if (isProcessAlive(proc.pid)) {
-        this.log.warn(
-          `[tunnel-cloudflare] Killing orphaned process ${proc.pid} (tunnel ${id})`,
-        );
-        await gracefulKill(proc, proc.pid);
+        this.log.warn(`Killing orphaned process ${proc.pid} (tunnel ${id})`);
+        await sdkGracefulKill(proc.pid, KILL_GRACE_MS);
       }
     }
     this.processes.clear();
 
-    // Wipe all storage keys for a clean slate.
     await this.storage.deleteAll(STORAGE_NS);
 
-    this.log.info(
-      "[tunnel-cloudflare] All tunnels stopped and storage cleared",
-    );
+    this.log.info("All tunnels stopped and storage cleared");
   }
 }
 
@@ -955,12 +706,6 @@ class CloudflareTunnelProvider implements TunnelProvider {
 
 /** Singleton provider instance — initialised in onServerStart. */
 let provider: CloudflareTunnelProvider | null = null;
-
-// ---------------------------------------------------------------------------
-// Prereq protocol (see PLUGIN_DEVELOPMENT_GUIDE.md → Plugin Prerequisites)
-// ---------------------------------------------------------------------------
-
-import { Elysia } from "elysia";
 
 // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
 function whichSync(bin: string): string | null {
@@ -1014,14 +759,103 @@ function createPrereqsRoutes() {
     .post("/uninstall", () => ({ ok: true }));
 }
 
-export const vibePlugin: VibePlugin = {
+/**
+ * Local extension of the SDK contract — `prerequisites` and the
+ * `providers` slot are agent-host extensions surfaced to the runtime
+ * registry. The SDK contract leaves these to the host implementation.
+ */
+type CloudflareVibePlugin = VibePlugin & {
+  prerequisites?: Array<{
+    name: string;
+    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
+    requiresSudo: boolean;
+    description?: string;
+  }>;
+  providers?: { tunnel?: TunnelProvider };
+};
+
+const telemetry = new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION);
+
+const lifecycle = createLifecycleHooks({
+  name: PLUGIN_NAME,
+  telemetryEventName: "tunnel.provider.ready",
+  onInit: async (hostServices: HostServices) => {
+    const log = new BoundLogger(hostServices.logger, PROVIDER_NAME);
+    log.info("Plugin initialising");
+
+    // Create the provider and wire it into the plugin's providers bag +
+    // the host's service registry.
+    provider = new CloudflareTunnelProvider(hostServices);
+    vibePlugin.providers = { tunnel: provider };
+
+    const providers = new ProviderRegistry(hostServices);
+    providers.registerProvider("tunnel", PROVIDER_NAME, provider);
+
+    telemetry.emit("tunnel.provider.ready", { provider: "cloudflare" });
+
+    // AGENT_TUNNEL=false: external process owns the tunnel.
+    if (process.env.AGENT_TUNNEL === "false") {
+      log.info(
+        "AGENT_TUNNEL=false — provider registered, tunnel managed externally",
+      );
+      return;
+    }
+
+    // Pre-flight: make sure cloudflared is available.
+    const health = await provider.healthCheck();
+    if (!health.ok) {
+      log.warn(
+        `cloudflared is not available — tunnel features will fail. ${health.message ?? ""}`,
+      );
+      return;
+    }
+    log.info(health.message ?? "cloudflared available");
+
+    // Start the agent tunnel.
+    try {
+      const baseUrl = hostServices.getAgentBaseUrl?.() ?? "";
+      const parsed = new URL(baseUrl);
+      const agentPort = parseInt(parsed.port, 10);
+
+      if (!Number.isFinite(agentPort) || agentPort <= 0) {
+        log.warn(
+          `Cannot determine agent port from "${baseUrl}" — skipping agent tunnel`,
+        );
+        return;
+      }
+
+      await provider.startAgentTunnel(agentPort);
+    } catch (err) {
+      log.error(
+        `Failed to start agent tunnel: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  },
+  onShutdown: async () => {
+    if (!provider) return;
+
+    if (
+      process.env.AGENT_TUNNEL === "false" ||
+      process.env.AGENT_TUNNEL_DETACH === "true"
+    ) {
+      provider.detachAll();
+      provider = null;
+      return;
+    }
+
+    await provider.stopAll();
+    provider = null;
+  },
+});
+
+export const vibePlugin: CloudflareVibePlugin = {
   capabilities: {
     storage: "rw",
     subprocess: true,
     telemetry: true,
   },
-  name: "tunnel-cloudflare",
-  version: "2.0.0",
+  name: PLUGIN_NAME,
+  version: PLUGIN_VERSION,
   description: "Cloudflare Tunnel provider for remote access",
   tags: ["backend", "provider"],
   apiPrefix: "/api/tunnel-cloudflare",
@@ -1036,87 +870,10 @@ export const vibePlugin: VibePlugin = {
   ],
 
   // The `tunnel` slot is populated at runtime during onServerStart.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  providers: { tunnel: undefined as any },
+  providers: {},
 
   createRoutes: () => createPrereqsRoutes(),
 
-  async onServerStart(
-    _app: ElysiaApp,
-    hostServices: HostServices,
-  ): Promise<void> {
-    hostServices?.telemetry?.emit("tunnel.provider.ready", { provider: "cloudflare" });
-    const log = hostServices.logger;
-
-    log.info("[tunnel-cloudflare] Plugin initialising");
-
-    // Create the provider and wire it into the plugin's providers bag.
-    provider = new CloudflareTunnelProvider(hostServices);
-    vibePlugin.providers!.tunnel = provider;
-
-    // AGENT_TUNNEL=false: external process owns the tunnel (e.g. dev-reload.sh).
-    // Register the provider so manual API calls work, but skip spawning cloudflared.
-    // The tunnel URL is provided via AGENT_TUNNEL_URL env var and read by
-    // getActiveTunnelUrl() so auto-report still works correctly.
-    if (process.env.AGENT_TUNNEL === "false") {
-      log.info(
-        "[tunnel-cloudflare] AGENT_TUNNEL=false — provider registered, tunnel managed externally",
-      );
-      return;
-    }
-
-    // Pre-flight: make sure cloudflared is available.
-    const health = await provider.healthCheck();
-    if (!health.ok) {
-      log.warn(
-        `[tunnel-cloudflare] cloudflared is not available — tunnel features will fail. ${health.message ?? ""}`,
-      );
-      // We don't throw here; the plugin still loads so other features work.
-      // Individual start() calls will fail with a clear error.
-      return;
-    }
-    log.info(`[tunnel-cloudflare] ${health.message}`);
-
-    // Start the agent tunnel. Parse the port from the agent's own base URL
-    // (e.g. "http://localhost:4100" → 4100).
-    try {
-      const baseUrl = hostServices.getAgentBaseUrl();
-      const parsed = new URL(baseUrl);
-      const agentPort = parseInt(parsed.port, 10);
-
-      if (!Number.isFinite(agentPort) || agentPort <= 0) {
-        log.warn(
-          `[tunnel-cloudflare] Cannot determine agent port from "${baseUrl}" — skipping agent tunnel`,
-        );
-        return;
-      }
-
-      await provider.startAgentTunnel(agentPort);
-    } catch (err) {
-      // Non-fatal: the agent continues to work on localhost even if the
-      // tunnel couldn't be established.
-      log.error(
-        `[tunnel-cloudflare] Failed to start agent tunnel: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  },
-
-  async onServerStop(): Promise<void> {
-    if (!provider) return;
-
-    // AGENT_TUNNEL=false: external process owns the tunnel, nothing to kill here.
-    // AGENT_TUNNEL_DETACH=true: leave cloudflared running so the tunnel URL
-    // survives a watch-mode restart (storage preserved for next boot to reconnect).
-    if (
-      process.env.AGENT_TUNNEL === "false" ||
-      process.env.AGENT_TUNNEL_DETACH === "true"
-    ) {
-      provider.detachAll();
-      provider = null;
-      return;
-    }
-
-    await provider.stopAll();
-    provider = null;
-  },
+  onServerStart: lifecycle.onServerStart,
+  onServerStop: lifecycle.onServerStop,
 };
