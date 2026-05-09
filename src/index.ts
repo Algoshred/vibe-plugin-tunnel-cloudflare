@@ -27,7 +27,9 @@ import {
 } from "@vibecontrols/plugin-sdk";
 import type {
   HostServices,
+  ProfileContext,
   VibePlugin,
+  VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
 
 import type {
@@ -60,7 +62,7 @@ function resolveCloudflaredCmd(): string {
 // ---------------------------------------------------------------------------
 
 const PLUGIN_NAME = "tunnel-cloudflare";
-const PLUGIN_VERSION = "2026.509.2";
+const PLUGIN_VERSION = "2026.509.3";
 const PROVIDER_NAME = "tunnel-cloudflare";
 const STORAGE_NS = "tunnel-cloudflare";
 
@@ -774,106 +776,123 @@ type CloudflareVibePlugin = VibePlugin & {
   providers?: { tunnel?: TunnelProvider };
 };
 
-const telemetry = new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION);
+/**
+ * Plugin contract V2 factory. Builds a fresh VibePlugin (with its own
+ * lifecycle/telemetry instances and providers bag) per call. The
+ * `provider` module-level binding is reused across calls because
+ * cloudflared subprocesses are global OS resources — having two
+ * profile-instances spawn duplicate tunnels would be unsafe.
+ */
+export const createPlugin: VibePluginFactory = (
+  _ctx: ProfileContext,
+): VibePlugin => {
+  const telemetry = new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION);
 
-const lifecycle = createLifecycleHooks({
-  name: PLUGIN_NAME,
-  telemetryEventName: "tunnel.provider.ready",
-  onInit: async (hostServices: HostServices) => {
-    const log = new BoundLogger(hostServices.logger, PROVIDER_NAME);
-    log.info("Plugin initialising");
+  const plugin: CloudflareVibePlugin = {
+    capabilities: {
+      storage: "rw",
+      subprocess: true,
+      telemetry: true,
+    },
+    name: PLUGIN_NAME,
+    version: PLUGIN_VERSION,
+    description: "Cloudflare Tunnel provider for remote access",
+    tags: ["backend", "provider"],
+    apiPrefix: "/api/tunnel-cloudflare",
 
-    // Create the provider and wire it into the plugin's providers bag +
-    // the host's service registry.
-    provider = new CloudflareTunnelProvider(hostServices);
-    vibePlugin.providers = { tunnel: provider };
+    prerequisites: [
+      {
+        name: "cloudflared",
+        kind: "binary",
+        requiresSudo: true,
+        description: "Cloudflare tunnel daemon",
+      },
+    ],
 
-    const providers = new ProviderRegistry(hostServices);
-    providers.registerProvider("tunnel", PROVIDER_NAME, provider);
+    // The `tunnel` slot is populated at runtime during onServerStart.
+    providers: {},
 
-    telemetry.emit("tunnel.provider.ready", { provider: "cloudflare" });
+    createRoutes: () => createPrereqsRoutes(),
+    // Lifecycle hooks attached after `plugin` exists so onInit can mutate
+    // `plugin.providers` (the agent reads it after onServerStart resolves).
+    onServerStart: undefined,
+    onServerStop: undefined,
+  };
 
-    // AGENT_TUNNEL=false: external process owns the tunnel.
-    if (process.env.AGENT_TUNNEL === "false") {
-      log.info(
-        "AGENT_TUNNEL=false — provider registered, tunnel managed externally",
-      );
-      return;
-    }
+  const lifecycle = createLifecycleHooks({
+    name: PLUGIN_NAME,
+    telemetryEventName: "tunnel.provider.ready",
+    onInit: async (hostServices: HostServices) => {
+      const log = new BoundLogger(hostServices.logger, PROVIDER_NAME);
+      log.info("Plugin initialising");
 
-    // Pre-flight: make sure cloudflared is available.
-    const health = await provider.healthCheck();
-    if (!health.ok) {
-      log.warn(
-        `cloudflared is not available — tunnel features will fail. ${health.message ?? ""}`,
-      );
-      return;
-    }
-    log.info(health.message ?? "cloudflared available");
+      // Create the provider and wire it into the plugin's providers bag +
+      // the host's service registry.
+      provider = new CloudflareTunnelProvider(hostServices);
+      plugin.providers = { tunnel: provider };
 
-    // Start the agent tunnel.
-    try {
-      const baseUrl = hostServices.getAgentBaseUrl?.() ?? "";
-      const parsed = new URL(baseUrl);
-      const agentPort = parseInt(parsed.port, 10);
+      const providers = new ProviderRegistry(hostServices);
+      providers.registerProvider("tunnel", PROVIDER_NAME, provider);
 
-      if (!Number.isFinite(agentPort) || agentPort <= 0) {
-        log.warn(
-          `Cannot determine agent port from "${baseUrl}" — skipping agent tunnel`,
+      telemetry.emit("tunnel.provider.ready", { provider: "cloudflare" });
+
+      // AGENT_TUNNEL=false: external process owns the tunnel.
+      if (process.env.AGENT_TUNNEL === "false") {
+        log.info(
+          "AGENT_TUNNEL=false — provider registered, tunnel managed externally",
         );
         return;
       }
 
-      await provider.startAgentTunnel(agentPort);
-    } catch (err) {
-      log.error(
-        `Failed to start agent tunnel: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  },
-  onShutdown: async () => {
-    if (!provider) return;
+      // Pre-flight: make sure cloudflared is available.
+      const health = await provider.healthCheck();
+      if (!health.ok) {
+        log.warn(
+          `cloudflared is not available — tunnel features will fail. ${health.message ?? ""}`,
+        );
+        return;
+      }
+      log.info(health.message ?? "cloudflared available");
 
-    if (
-      process.env.AGENT_TUNNEL === "false" ||
-      process.env.AGENT_TUNNEL_DETACH === "true"
-    ) {
-      provider.detachAll();
-      provider = null;
-      return;
-    }
+      // Start the agent tunnel.
+      try {
+        const baseUrl = hostServices.getAgentBaseUrl?.() ?? "";
+        const parsed = new URL(baseUrl);
+        const agentPort = parseInt(parsed.port, 10);
 
-    await provider.stopAll();
-    provider = null;
-  },
-});
+        if (!Number.isFinite(agentPort) || agentPort <= 0) {
+          log.warn(
+            `Cannot determine agent port from "${baseUrl}" — skipping agent tunnel`,
+          );
+          return;
+        }
 
-export const vibePlugin: CloudflareVibePlugin = {
-  capabilities: {
-    storage: "rw",
-    subprocess: true,
-    telemetry: true,
-  },
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  description: "Cloudflare Tunnel provider for remote access",
-  tags: ["backend", "provider"],
-  apiPrefix: "/api/tunnel-cloudflare",
-
-  prerequisites: [
-    {
-      name: "cloudflared",
-      kind: "binary",
-      requiresSudo: true,
-      description: "Cloudflare tunnel daemon",
+        await provider.startAgentTunnel(agentPort);
+      } catch (err) {
+        log.error(
+          `Failed to start agent tunnel: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     },
-  ],
+    onShutdown: async () => {
+      if (!provider) return;
 
-  // The `tunnel` slot is populated at runtime during onServerStart.
-  providers: {},
+      if (
+        process.env.AGENT_TUNNEL === "false" ||
+        process.env.AGENT_TUNNEL_DETACH === "true"
+      ) {
+        provider.detachAll();
+        provider = null;
+        return;
+      }
 
-  createRoutes: () => createPrereqsRoutes(),
+      await provider.stopAll();
+      provider = null;
+    },
+  });
 
-  onServerStart: lifecycle.onServerStart,
-  onServerStop: lifecycle.onServerStop,
+  plugin.onServerStart = lifecycle.onServerStart;
+  plugin.onServerStop = lifecycle.onServerStop;
+
+  return plugin;
 };
