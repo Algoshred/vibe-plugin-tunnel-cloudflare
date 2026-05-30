@@ -799,6 +799,9 @@ export const createPlugin: VibePluginFactory = (
     description: "Cloudflare Tunnel provider for remote access",
     tags: ["backend", "provider"],
     apiPrefix: "/api/tunnel-cloudflare",
+    // The agent adds this to its tunnel-URL allow-list at registration, so the
+    // thin agent never hardcodes a cloudflare domain in its url-security layer.
+    tunnelDomainSuffixes: [".trycloudflare.com"],
 
     prerequisites: [
       {
