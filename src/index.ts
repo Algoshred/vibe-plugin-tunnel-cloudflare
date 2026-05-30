@@ -889,10 +889,26 @@ export const createPlugin: VibePluginFactory = (
       await provider.stopAll();
       provider = null;
     },
+    // `vibe nuke` runs this while the daemon is still up, so the provider
+    // singleton + its in-memory process map are reachable. Tear down every
+    // cloudflared this provider spawned and wipe its storage. Unlike
+    // onShutdown, nuke ALWAYS reaps (it ignores AGENT_TUNNEL_DETACH — a nuke
+    // is a full teardown, not a hot reload). The agent never names cloudflared;
+    // that knowledge lives here.
+    onNuke: async (_hostServices, ctx) => {
+      if (!provider) return { notes: ["tunnel provider not initialised"] };
+      if (ctx.dryRun) {
+        return { reaped: ["cloudflared tunnels + tunnel-cloudflare storage"] };
+      }
+      await provider.stopAll();
+      provider = null;
+      return { reaped: ["cloudflared tunnels + tunnel-cloudflare storage"] };
+    },
   });
 
   plugin.onServerStart = lifecycle.onServerStart;
   plugin.onServerStop = lifecycle.onServerStop;
+  plugin.onNuke = lifecycle.onNuke;
 
   return plugin;
 };
