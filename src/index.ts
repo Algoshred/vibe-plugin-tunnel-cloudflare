@@ -647,7 +647,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
           status: "active",
           protocol: "http",
           localPort: agentPort,
-          localHost: "localhost",
+          localHost: "127.0.0.1",
           url: envBootstrapUrl,
           pid,
           createdAt: new Date().toISOString(),
@@ -682,7 +682,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
           status: "active",
           protocol: "http",
           localPort: agentPort,
-          localHost: "localhost",
+          localHost: "127.0.0.1",
           url: storedUrl,
           pid: storedPid,
           createdAt: new Date().toISOString(),
@@ -696,7 +696,7 @@ class CloudflareTunnelProvider implements TunnelProvider {
     const session = await this.issueSession({
       protocol: "http",
       localPort: agentPort,
-      localHost: "localhost",
+      localHost: "127.0.0.1",
       metadata: { isAgentTunnel: true, name: "agent" },
     });
     const info = await this.start(session.tunnelId);
