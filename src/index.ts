@@ -31,6 +31,12 @@ import type {
   VibePlugin,
   VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
+import {
+  installBinary,
+  resolveBinary,
+  type BinaryDownload,
+  type ToolPlatform,
+} from "@vibecontrols/plugin-sdk/install";
 
 import type {
   AgentStorageProvider,
@@ -43,18 +49,49 @@ import type {
 } from "./types.js";
 
 /**
- * Resolve the cloudflared binary path with the platform-correct extension.
- * `Bun.which` searches PATH and on Windows handles the .exe suffix
- * implicitly; falling back to the bare name lets the OS error give a
- * sensible "command not found" instead of us silently passing nothing.
+ * Official cloudflared release assets per platform. The provider downloads the
+ * correct one to the agent's binary cache (~/.boff/vibecontrols/tools) via the
+ * SDK installer, so cloudflared is owned + installed by THIS plugin — the thin
+ * agent never installs it. "latest" keeps users on a current build; once
+ * cached the binary is reused.
+ */
+const CLOUDFLARED_BASE =
+  "https://github.com/cloudflare/cloudflared/releases/latest/download";
+const CLOUDFLARED_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
+  "linux-x64": { url: `${CLOUDFLARED_BASE}/cloudflared-linux-amd64`, archive: "raw" },
+  "linux-arm64": { url: `${CLOUDFLARED_BASE}/cloudflared-linux-arm64`, archive: "raw" },
+  "darwin-x64": {
+    url: `${CLOUDFLARED_BASE}/cloudflared-darwin-amd64.tgz`,
+    archive: "tar.gz",
+    binaryWithinArchive: "cloudflared",
+  },
+  "darwin-arm64": {
+    url: `${CLOUDFLARED_BASE}/cloudflared-darwin-arm64.tgz`,
+    archive: "tar.gz",
+    binaryWithinArchive: "cloudflared",
+  },
+  "win32-x64": {
+    url: `${CLOUDFLARED_BASE}/cloudflared-windows-amd64.exe`,
+    archive: "raw",
+  },
+  "win32-arm64": {
+    url: `${CLOUDFLARED_BASE}/cloudflared-windows-arm64.exe`,
+    archive: "raw",
+  },
+};
+
+/**
+ * Resolve the cloudflared binary path. Prefers the provider-managed cache
+ * (absolute path, immune to the PATH snapshot `Bun.which` takes at process
+ * start — the reason a freshly-installed cloudflared was invisible to the
+ * running daemon on Windows), then the current PATH, then the bare name so the
+ * OS gives a sensible "command not found".
  */
 function resolveCloudflaredCmd(): string {
-  const bare =
-    typeof Bun !== "undefined" && typeof Bun.which === "function"
-      ? Bun.which("cloudflared")
-      : null;
-  if (bare) return bare;
-  return process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+  return (
+    resolveBinary("cloudflared") ??
+    (process.platform === "win32" ? "cloudflared.exe" : "cloudflared")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -709,15 +746,10 @@ class CloudflareTunnelProvider implements TunnelProvider {
 /** Singleton provider instance — initialised in onServerStart. */
 let provider: CloudflareTunnelProvider | null = null;
 
-// Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
-function whichSync(bin: string): string | null {
-  return Bun.which(bin) ?? null;
-}
-
 function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
-      const cf = whichSync("cloudflared");
+      const cf = resolveBinary("cloudflared");
       return {
         satisfied: !!cf,
         missing: cf
@@ -726,37 +758,53 @@ function createPrereqsRoutes() {
               {
                 name: "cloudflared",
                 kind: "binary" as const,
-                requiresSudo: true,
+                requiresSudo: false,
                 detected: undefined,
               },
             ],
       };
     })
-    .post("/install", () => {
-      const cf = whichSync("cloudflared");
-      if (cf) return { ok: true, installed: [], pendingSudo: [], errors: [] };
-
-      const cmd =
-        process.platform === "darwin"
-          ? "brew install cloudflared"
-          : process.platform === "linux"
-            ? "curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && sudo chmod +x /usr/local/bin/cloudflared"
+    .post("/install", async () => {
+      // Already resolvable (cache or PATH)? Nothing to do.
+      if (resolveBinary("cloudflared")) {
+        return { ok: true, installed: [], pendingSudo: [], errors: [] };
+      }
+      // Auto-download cloudflared into the agent binary cache. No sudo: the
+      // cache lives under the user's home dir.
+      try {
+        await installBinary({
+          name: "cloudflared",
+          downloads: CLOUDFLARED_DOWNLOADS,
+          versionMatcher: "cloudflared version",
+        });
+        return {
+          ok: true,
+          installed: ["cloudflared"],
+          pendingSudo: [],
+          errors: [],
+        };
+      } catch (err) {
+        // Auto-download failed (offline, unsupported arch) — fall back to a
+        // manual instruction so the operator can still recover.
+        const manual =
+          process.platform === "darwin"
+            ? "brew install cloudflared"
             : process.platform === "win32"
-              ? "winget install Cloudflare.cloudflared    # or: scoop install cloudflared    # or download from https://github.com/cloudflare/cloudflared/releases"
+              ? "winget install Cloudflare.cloudflared    # or download from https://github.com/cloudflare/cloudflared/releases"
               : "see https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
-
-      return {
-        ok: true,
-        installed: [],
-        pendingSudo: [
-          {
-            name: "cloudflared",
-            command: cmd,
-            reason: "cloudflared is required to start tunnels.",
-          },
-        ],
-        errors: [],
-      };
+        return {
+          ok: false,
+          installed: [],
+          pendingSudo: [
+            {
+              name: "cloudflared",
+              command: manual,
+              reason: `cloudflared auto-download failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          errors: [err instanceof Error ? err.message : String(err)],
+        };
+      }
     })
     .post("/uninstall", () => ({ ok: true }));
 }
@@ -807,8 +855,9 @@ export const createPlugin: VibePluginFactory = (
       {
         name: "cloudflared",
         kind: "binary",
-        requiresSudo: true,
-        description: "Cloudflare tunnel daemon",
+        requiresSudo: false,
+        description:
+          "Cloudflare tunnel daemon (auto-downloaded to the agent binary cache)",
       },
     ],
 
