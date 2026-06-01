@@ -32,10 +32,9 @@ import type {
   VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
 import {
+  CLOUDFLARED_DOWNLOADS,
   installBinary,
   resolveBinary,
-  type BinaryDownload,
-  type ToolPlatform,
 } from "@vibecontrols/plugin-sdk/install";
 
 import type {
@@ -48,37 +47,10 @@ import type {
   TunnelSessionInfo,
 } from "./types.js";
 
-/**
- * Official cloudflared release assets per platform. The provider downloads the
- * correct one to the agent's binary cache (~/.boff/vibecontrols/tools) via the
- * SDK installer, so cloudflared is owned + installed by THIS plugin — the thin
- * agent never installs it. "latest" keeps users on a current build; once
- * cached the binary is reused.
- */
-const CLOUDFLARED_BASE =
-  "https://github.com/cloudflare/cloudflared/releases/latest/download";
-const CLOUDFLARED_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
-  "linux-x64": { url: `${CLOUDFLARED_BASE}/cloudflared-linux-amd64`, archive: "raw" },
-  "linux-arm64": { url: `${CLOUDFLARED_BASE}/cloudflared-linux-arm64`, archive: "raw" },
-  "darwin-x64": {
-    url: `${CLOUDFLARED_BASE}/cloudflared-darwin-amd64.tgz`,
-    archive: "tar.gz",
-    binaryWithinArchive: "cloudflared",
-  },
-  "darwin-arm64": {
-    url: `${CLOUDFLARED_BASE}/cloudflared-darwin-arm64.tgz`,
-    archive: "tar.gz",
-    binaryWithinArchive: "cloudflared",
-  },
-  "win32-x64": {
-    url: `${CLOUDFLARED_BASE}/cloudflared-windows-amd64.exe`,
-    archive: "raw",
-  },
-  "win32-arm64": {
-    url: `${CLOUDFLARED_BASE}/cloudflared-windows-arm64.exe`,
-    archive: "raw",
-  },
-};
+// cloudflared release manifest is the SDK's single shared `CLOUDFLARED_DOWNLOADS`
+// (imported above) — the agent's pre-registration bootstrap tunnel uses the same
+// source, so the two never drift. cloudflared is owned + installed by THIS
+// plugin via the SDK installer into the agent's binary cache.
 
 /**
  * Resolve the cloudflared binary path. Prefers the provider-managed cache
