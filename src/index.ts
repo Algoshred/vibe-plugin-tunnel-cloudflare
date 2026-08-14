@@ -960,11 +960,17 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       // or network failure). Otherwise the one case that most needs retrying —
       // never got a tunnel at all — would be the one case that never retries,
       // leaving the agent with no inbound path until a manual restart.
-      this.supervisor.start();
+      //
+      // Unless this instance was retired while the start was in flight: the
+      // boot-time double-init lands ~1.5s after the first, which is well
+      // inside the seconds `cloudflared` takes to print a URL. Re-arming here
+      // would undo the handover and put two supervisors back on one fleet.
+      if (!this.shuttingDown) this.supervisor.start();
     }
   }
 
-  private async startAgentTunnelInternal(
+  /** `protected` so tests can stand in for the spawn without running cloudflared. */
+  protected async startAgentTunnelInternal(
     agentPort: number,
   ): Promise<TunnelInfo> {
     // Adopt the bootstrap cloudflared if one is alive. The agent's

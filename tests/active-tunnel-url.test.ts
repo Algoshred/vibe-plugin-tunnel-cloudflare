@@ -253,3 +253,54 @@ describe("plugin identity + supervision handover", () => {
     expect(provider.isSupervising).toBe(false);
   });
 });
+
+describe("supervision handover during an in-flight start", () => {
+  /**
+   * The boot-time second init lands ~1.5s after the first — well inside the
+   * seconds `cloudflared` takes to print a URL. If the outgoing instance
+   * re-armed its supervisor when that start finally returned, the handover
+   * would be undone and two supervisors would be back on one process fleet.
+   */
+  class SlowStartProvider extends CloudflareTunnelProvider {
+    retireMidStart = false;
+    protected override async startAgentTunnelInternal(
+      port: number,
+    ): Promise<TunnelInfo> {
+      if (this.retireMidStart) this.standDownSupervision();
+      return makeInfo({ id: "stub-agent-tunnel", localPort: port });
+    }
+  }
+
+  function makeStub() {
+    const store = new Map<string, string>();
+    const storage = {
+      get: async (ns: string, key: string) => store.get(`${ns}:${key}`) ?? null,
+      set: async (ns: string, key: string, value: string) => {
+        store.set(`${ns}:${key}`, value);
+      },
+      delete: async (ns: string, key: string) => {
+        store.delete(`${ns}:${key}`);
+      },
+      list: async () => [...store.keys()],
+      deleteAll: async () => store.clear(),
+    };
+    return new SlowStartProvider({
+      storage,
+      logger: undefined,
+    } as unknown as HostServices);
+  }
+
+  it("arms supervision after a normal start", async () => {
+    const provider = makeStub();
+    await provider.startAgentTunnel(3005);
+    expect(provider.isSupervising).toBe(true);
+    provider.standDownSupervision();
+  });
+
+  it("does not re-arm when the instance was retired mid-start", async () => {
+    const provider = makeStub();
+    provider.retireMidStart = true;
+    await provider.startAgentTunnel(3005);
+    expect(provider.isSupervising).toBe(false);
+  });
+});
