@@ -448,32 +448,43 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
     const isAgentTunnel = Boolean(info.metadata?.["isAgentTunnel"]);
 
-    void proc.exited.then((code) => {
+    void proc.exited.then(async (code) => {
       // A deliberate stop kills the process before clearing the handle, so
       // only treat an exit as a crash when nobody asked for it.
       if (this.shuttingDown || this.intentionalStops.has(tunnelId)) return;
-      if (this.processes.has(tunnelId)) {
-        this.log.warn(
-          `Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
-        );
-        this.processes.delete(tunnelId);
-        void this.loadTunnels().then((current) => {
-          const idx = current.findIndex((t) => t.id === tunnelId);
-          if (idx >= 0) {
-            current[idx] = {
-              ...current[idx]!,
-              status: "error",
-              updatedAt: new Date().toISOString(),
-              metadata: { ...current[idx]!.metadata, exitCode: code },
-            };
-            void this.saveTunnels(current);
-          }
-        });
-        // The agent tunnel is the machine's only inbound path — start
-        // recovery now rather than at the next poll.
-        if (isAgentTunnel || tunnelId === this.agentTunnelId) {
-          this.onAgentTunnelExited();
+      if (!this.processes.has(tunnelId)) return;
+
+      this.log.warn(
+        `Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
+      );
+      this.processes.delete(tunnelId);
+
+      // Record the crash BEFORE kicking recovery. These two write the same
+      // record, so leaving the error write in flight lets it land after the
+      // restart has already saved the fresh `active` row and flip a recovered
+      // tunnel back to `error`.
+      try {
+        const current = await this.loadTunnels();
+        const idx = current.findIndex((t) => t.id === tunnelId);
+        if (idx >= 0) {
+          current[idx] = {
+            ...current[idx]!,
+            status: "error",
+            updatedAt: new Date().toISOString(),
+            metadata: { ...current[idx]!.metadata, exitCode: code },
+          };
+          await this.saveTunnels(current);
         }
+      } catch (err) {
+        this.log.warn(
+          `Failed to record exit of tunnel ${tunnelId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // The agent tunnel is the machine's only inbound path — start
+      // recovery now rather than at the next poll.
+      if (isAgentTunnel || tunnelId === this.agentTunnelId) {
+        this.onAgentTunnelExited();
       }
     });
 

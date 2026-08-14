@@ -175,6 +175,39 @@ describe("AgentTunnelSupervisor.tick", () => {
     expect(state.restarts).toBe(3);
   });
 
+  it("does not reject when the liveness probe fails — it retries next tick", async () => {
+    const { deps, state } = makeHarness();
+    const failing: AgentTunnelSupervisorDeps = {
+      ...deps,
+      getAgentTunnelPid: async () => {
+        throw new Error("storage unavailable");
+      },
+    };
+    const supervisor = new AgentTunnelSupervisor(failing);
+
+    expect(await supervisor.tick()).toBe("failed");
+    // Probing storage is cheap, so it keeps checking rather than backing off —
+    // and it must never restart on top of a URL it failed to retract.
+    expect(await supervisor.tick()).toBe("failed");
+    expect(state.restarts).toBe(0);
+  });
+
+  it("does not reject when retracting the stale URL fails", async () => {
+    const { deps, state } = makeHarness({ alivePids: new Set<number>() });
+    const failing: AgentTunnelSupervisorDeps = {
+      ...deps,
+      clearAgentTunnel: async () => {
+        throw new Error("storage unavailable");
+      },
+    };
+    const supervisor = new AgentTunnelSupervisor(failing);
+
+    // Never restart on top of a URL we failed to retract — the old hostname
+    // could still be published.
+    expect(await supervisor.tick()).toBe("failed");
+    expect(state.restarts).toBe(0);
+  });
+
   it("never runs two ticks concurrently", async () => {
     const { deps, state } = makeHarness({ alivePids: new Set<number>() });
     let release!: (url: string | null) => void;

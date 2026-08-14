@@ -100,7 +100,12 @@ export class AgentTunnelSupervisor {
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.tick();
+      // `tick()` converts dependency failures into a `failed` result, but a
+      // rejection here would surface as an unhandled rejection and could take
+      // the daemon down — the opposite of self-healing. Belt and braces.
+      void this.tick().catch(() => {
+        /* next tick retries */
+      });
     }, this.intervalMs);
     // Never hold the event loop open just to supervise a tunnel.
     this.timer.unref?.();
@@ -131,16 +136,30 @@ export class AgentTunnelSupervisor {
     try {
       if (this.deps.isPaused()) return "paused";
 
-      const pid = await this.deps.getAgentTunnelPid();
-      if (pid !== null && this.deps.isAlive(pid)) {
-        this.attempts = 0;
-        this.nextAttemptAt = 0;
-        return "alive";
-      }
+      let pid: number | null;
+      try {
+        pid = await this.deps.getAgentTunnelPid();
+        if (pid !== null && this.deps.isAlive(pid)) {
+          this.attempts = 0;
+          this.nextAttemptAt = 0;
+          return "alive";
+        }
 
-      // Dead (or unknown) — retract the stale URL before anything else so no
-      // consumer can publish a hostname that stopped resolving.
-      await this.deps.clearAgentTunnel();
+        // Dead (or unknown) — retract the stale URL before anything else so no
+        // consumer can publish a hostname that stopped resolving.
+        await this.deps.clearAgentTunnel();
+      } catch (err) {
+        // Storage can be mid-rotation or briefly unavailable. Report the
+        // failure and try again on the next tick rather than letting the
+        // rejection escape into the interval and kill supervision. No backoff
+        // is armed: probing storage is cheap, and we must NOT restart on top
+        // of a URL we failed to retract — the dead hostname could still be
+        // published.
+        this.deps.log.warn("Agent tunnel liveness check failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return "failed";
+      }
 
       const now = this.now();
       if (now < this.nextAttemptAt) return "backoff";
@@ -168,15 +187,19 @@ export class AgentTunnelSupervisor {
         return "restarted";
       }
 
-      const delay = restartBackoffMs(this.attempts + 1);
-      this.nextAttemptAt = this.now() + delay;
+      this.armBackoff();
       this.deps.log.warn("Agent tunnel restart did not yield a URL", {
         attempt: this.attempts,
-        retryInMs: delay,
+        retryInMs: restartBackoffMs(this.attempts + 1),
       });
       return "failed";
     } finally {
       this.ticking = false;
     }
+  }
+
+  /** Hold off the next restart for the current attempt's backoff window. */
+  private armBackoff(): void {
+    this.nextAttemptAt = this.now() + restartBackoffMs(this.attempts + 1);
   }
 }
