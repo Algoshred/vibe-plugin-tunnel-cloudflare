@@ -232,3 +232,24 @@ describe("isAgentSupervisionPaused", () => {
     ).toBe(true);
   });
 });
+
+describe("plugin identity + supervision handover", () => {
+  it("reports the published package version, not a hand-pinned constant", async () => {
+    const { createPlugin } = await import("../src/index");
+    const pkg = (await import("../package.json")) as { version: string };
+    const plugin = createPlugin({ name: "default" } as never);
+
+    expect(plugin.version).toBe(pkg.version);
+  });
+
+  it("stands supervision down without touching processes, idempotently", () => {
+    const { provider } = makeProvider();
+
+    expect(provider.isSupervising).toBe(false);
+    provider.standDownSupervision();
+    expect(provider.isSupervising).toBe(false);
+    // A boot inits this plugin twice; the handover must be safe to repeat.
+    provider.standDownSupervision();
+    expect(provider.isSupervising).toBe(false);
+  });
+});

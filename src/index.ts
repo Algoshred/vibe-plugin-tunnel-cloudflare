@@ -14,6 +14,8 @@
  * lifecycle, telemetry, logger and subprocess helpers.
  */
 
+import { createRequire } from "node:module";
+
 import type { Subprocess } from "bun";
 import { Elysia } from "elysia";
 
@@ -72,7 +74,29 @@ function resolveCloudflaredCmd(): string {
 // ---------------------------------------------------------------------------
 
 const PLUGIN_NAME = "tunnel-cloudflare";
-const PLUGIN_VERSION = "2026.509.3";
+
+/**
+ * The published package version, read from package.json rather than pinned in
+ * source. CI stamps the CalVer version at publish time, so a hand-maintained
+ * constant drifts immediately: it still read `2026.509.3` while npm served
+ * `2026.814.1`, which made the agent log "refreshed to X but registry latest
+ * is Y — a stale resolver/cache may still be in play" on every boot and left
+ * `plugins.json` reporting a version nobody was running. Resolves in both
+ * layouts (`src/index.ts` and `dist/index.js` are each one level below the
+ * package root); the literal is only a last-resort fallback.
+ */
+function resolvePluginVersion(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg = require("../package.json") as { version?: string };
+    if (typeof pkg.version === "string" && pkg.version) return pkg.version;
+  } catch {
+    /* fall through */
+  }
+  return "0.0.0-unknown";
+}
+
+const PLUGIN_VERSION = resolvePluginVersion();
 const PROVIDER_NAME = "tunnel-cloudflare";
 const STORAGE_NS = "tunnel-cloudflare";
 
@@ -1034,6 +1058,27 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   }
 
   /**
+   * Stop supervising WITHOUT touching any running process.
+   *
+   * `cloudflared` processes are global OS resources, but a daemon boot
+   * initialises this plugin twice: once when it loads, and again after the
+   * plugin manager refresh-installs `@latest` and re-inits it. Each init built
+   * a provider with its own supervisor, so both polled the same agent tunnel,
+   * both saw it die, and both rebuilt it — two `cloudflared` processes, one of
+   * them instantly orphaned (observed live on 2026-08-14). The outgoing
+   * instance stands down here so exactly one supervisor owns the fleet.
+   */
+  standDownSupervision(): void {
+    this.shuttingDown = true;
+    this.supervisor.stop();
+  }
+
+  /** Whether this instance is the one currently watching the agent tunnel. */
+  get isSupervising(): boolean {
+    return this.supervisor.isRunning;
+  }
+
+  /**
    * Tear down every tunnel this provider is tracking and clear storage.
    */
   async stopAll(): Promise<void> {
@@ -1205,7 +1250,10 @@ export const createPlugin: VibePluginFactory = (
       log.info("Plugin initialising");
 
       // Create the provider and wire it into the plugin's providers bag +
-      // the host's service registry.
+      // the host's service registry. Any previous instance stands down first:
+      // a boot inits this plugin twice (load, then refresh-install of @latest),
+      // and two live supervisors would race to rebuild the same agent tunnel.
+      provider?.standDownSupervision();
       provider = new CloudflareTunnelProvider(hostServices);
       plugin.providers = { tunnel: provider };
 
