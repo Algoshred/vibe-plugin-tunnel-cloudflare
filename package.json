@@ -20,10 +20,11 @@
     "format": "bunx prettier . --write",
     "format:check": "bunx prettier . --check",
     "type:check": "bash scripts/build-limits.sh tsc --noEmit",
+    "test": "bun test",
     "clean": "rimraf dist",
     "prebuild": "bun run clean",
     "prepublishOnly": "bun run build",
-    "sanity": "bash scripts/build-limits.sh --gate bash -c 'bun run format:check && bun run lint:sanity && bun run type:check && bun run build'"
+    "sanity": "bash scripts/build-limits.sh --gate bash -c 'bun run format:check && bun run lint:sanity && bun run type:check && bun run test && bun run build'"
   },
   "dependencies": {
     "@vibecontrols/plugin-sdk": "2026.601.1",

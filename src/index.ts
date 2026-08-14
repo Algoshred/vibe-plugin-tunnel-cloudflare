@@ -37,6 +37,7 @@ import {
   resolveBinary,
 } from "@vibecontrols/plugin-sdk/install";
 
+import { AgentTunnelSupervisor } from "./agent-tunnel-supervisor.js";
 import type {
   AgentStorageProvider,
   IssueSessionRequest,
@@ -168,7 +169,7 @@ async function extractTunnelUrl(proc: Subprocess): Promise<string> {
 // CloudflareTunnelProvider
 // ---------------------------------------------------------------------------
 
-class CloudflareTunnelProvider implements TunnelProvider {
+export class CloudflareTunnelProvider implements TunnelProvider {
   readonly name = PROVIDER_NAME;
 
   /** In-memory map of tunnel ID → spawned Subprocess. */
@@ -178,6 +179,21 @@ class CloudflareTunnelProvider implements TunnelProvider {
   private readonly log: BoundLogger;
   private readonly hostServices: HostServices;
 
+  /**
+   * Agent-tunnel supervision state. The agent tunnel (and only the agent
+   * tunnel) is kept alive automatically: it is the machine's single inbound
+   * path, so losing it silently is what makes an agent look Degraded.
+   */
+  private readonly supervisor: AgentTunnelSupervisor;
+  /** Local port the agent tunnel fronts — needed to rebuild it after a crash. */
+  private agentTunnelPort: number | null = null;
+  /** Tunnel record id of the agent tunnel, when this provider spawned it. */
+  private agentTunnelId: string | null = null;
+  /** Set while the provider is tearing down (shutdown / nuke). */
+  private shuttingDown = false;
+  /** Tunnel ids being stopped on purpose — their exits are not crashes. */
+  private readonly intentionalStops = new Set<string>();
+
   constructor(hostServices: HostServices) {
     this.hostServices = hostServices;
     // The agent's runtime storage surface is richer than the SDK's neutral
@@ -185,6 +201,97 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // a single structural cast at the boundary.
     this.storage = hostServices.storage as unknown as AgentStorageProvider;
     this.log = new BoundLogger(hostServices.logger, PROVIDER_NAME);
+    this.supervisor = new AgentTunnelSupervisor({
+      getAgentTunnelPid: () => this.readAgentTunnelPid(),
+      isAlive: (pid) => isProcessAlive(pid),
+      clearAgentTunnel: () => this.clearAgentTunnelKeys(),
+      restartAgentTunnel: () => this.restartAgentTunnel(),
+      isPaused: () =>
+        this.shuttingDown ||
+        (this.agentTunnelId !== null &&
+          this.intentionalStops.has(this.agentTunnelId)),
+      log: {
+        info: (message, meta) => this.log.info(message, meta),
+        warn: (message, meta) => this.log.warn(message, meta),
+      },
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Agent-tunnel supervision
+  // -----------------------------------------------------------------------
+
+  /** PID recorded for the agent tunnel, or null when none is persisted. */
+  private async readAgentTunnelPid(): Promise<number | null> {
+    const raw = await this.storage.get(STORAGE_NS, KEY_AGENT_PID);
+    if (!raw) return null;
+    const pid = parseInt(raw, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  }
+
+  /**
+   * Forget the agent tunnel's URL + PID. Called the moment the owning process
+   * is found dead so no consumer can keep publishing a `*.trycloudflare.com`
+   * hostname that has already gone NXDOMAIN.
+   */
+  private async clearAgentTunnelKeys(): Promise<void> {
+    await this.storage.delete(STORAGE_NS, KEY_AGENT_URL);
+    await this.storage.delete(STORAGE_NS, KEY_AGENT_PID);
+  }
+
+  /** Persist the agent tunnel's public URL + owning PID. */
+  private async persistAgentTunnel(info: TunnelInfo): Promise<void> {
+    if (info.url) {
+      await this.storage.set(STORAGE_NS, KEY_AGENT_URL, info.url);
+    }
+    if (info.pid !== undefined) {
+      await this.storage.set(STORAGE_NS, KEY_AGENT_PID, String(info.pid));
+    }
+  }
+
+  /**
+   * Rebuild the agent tunnel after its `cloudflared` died. Re-uses the
+   * existing tunnel record when we own one (same id, fresh process, new
+   * public URL — exactly what `rotate()` does) so a flapping tunnel doesn't
+   * accumulate a record per crash; otherwise falls back to a full
+   * `startAgentTunnel`, which also covers the adopted-bootstrap case where no
+   * record of our own exists.
+   *
+   * Returns the new public URL, or null when the restart produced nothing
+   * usable (unknown port, or a rate-limited placeholder) so the supervisor
+   * backs off instead of treating it as recovered.
+   */
+  private async restartAgentTunnel(): Promise<string | null> {
+    const port = this.agentTunnelPort;
+    if (port === null) return null;
+
+    const existingId = this.agentTunnelId;
+    if (existingId) {
+      // Drop the dead handle so `start()` re-spawns rather than early-returning.
+      this.processes.delete(existingId);
+      const tunnels = await this.loadTunnels();
+      if (tunnels.some((t) => t.id === existingId)) {
+        const info = await this.start(existingId);
+        if (info.metadata?.["degraded"]) return null;
+        await this.persistAgentTunnel(info);
+        return info.url || null;
+      }
+    }
+
+    const info = await this.startAgentTunnel(port);
+    if (info.metadata?.["degraded"]) return null;
+    return info.url || null;
+  }
+
+  /**
+   * React to an agent-tunnel process dying without waiting for the next poll.
+   * Fire-and-forget: supervision must never throw into a process-exit handler.
+   */
+  private onAgentTunnelExited(): void {
+    if (this.shuttingDown) return;
+    void this.supervisor.tick().catch(() => {
+      /* the periodic tick will retry */
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -339,7 +446,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
     );
     this.processes.set(tunnelId, proc);
 
+    const isAgentTunnel = Boolean(info.metadata?.["isAgentTunnel"]);
+
     void proc.exited.then((code) => {
+      // A deliberate stop kills the process before clearing the handle, so
+      // only treat an exit as a crash when nobody asked for it.
+      if (this.shuttingDown || this.intentionalStops.has(tunnelId)) return;
       if (this.processes.has(tunnelId)) {
         this.log.warn(
           `Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
@@ -357,6 +469,11 @@ class CloudflareTunnelProvider implements TunnelProvider {
             void this.saveTunnels(current);
           }
         });
+        // The agent tunnel is the machine's only inbound path — start
+        // recovery now rather than at the next poll.
+        if (isAgentTunnel || tunnelId === this.agentTunnelId) {
+          this.onAgentTunnelExited();
+        }
       }
     });
 
@@ -423,10 +540,21 @@ class CloudflareTunnelProvider implements TunnelProvider {
     const info = tunnels.find((t) => t.id === tunnelId);
     if (!info) throw new Error(`Tunnel ${tunnelId} not found`);
 
-    await this.stop(tunnelId);
-    // Re-use the tunnel's existing target + metadata and spin up a fresh
-    // cloudflared process (which yields a new trycloudflare URL).
-    await this.start(tunnelId);
+    // Hold the "deliberate" flag across the whole stop→start window: a rotate
+    // legitimately leaves the tunnel dead for a moment, and the supervisor
+    // must not race in and spawn a competing cloudflared in that gap.
+    this.intentionalStops.add(tunnelId);
+    try {
+      await this.stopInternal(tunnelId);
+      // Re-use the tunnel's existing target + metadata and spin up a fresh
+      // cloudflared process (which yields a new trycloudflare URL).
+      const rotated = await this.start(tunnelId);
+      if (tunnelId === this.agentTunnelId) {
+        await this.persistAgentTunnel(rotated);
+      }
+    } finally {
+      this.intentionalStops.delete(tunnelId);
+    }
     const updated = (await this.loadTunnels()).find((t) => t.id === tunnelId);
     const sessionId = updated?.sessionId ?? crypto.randomUUID();
     return {
@@ -463,7 +591,25 @@ class CloudflareTunnelProvider implements TunnelProvider {
 
   async stop(tunnelId: string): Promise<void> {
     this.log.info(`Stopping tunnel ${tunnelId}`);
+    // Mark the stop as deliberate for the whole teardown so neither the exit
+    // handler nor the supervisor races in and "recovers" a tunnel the caller
+    // just asked to shut down. `rotate()` stops then starts, so the flag is
+    // cleared in `finally` — never left latched.
+    this.intentionalStops.add(tunnelId);
+    try {
+      await this.stopInternal(tunnelId);
+      // An operator (or the control plane) asking for the agent tunnel to go
+      // down means it should STAY down — supervision resumes only when
+      // something starts it again.
+      if (tunnelId === this.agentTunnelId) {
+        this.supervisor.stop();
+      }
+    } finally {
+      this.intentionalStops.delete(tunnelId);
+    }
+  }
 
+  private async stopInternal(tunnelId: string): Promise<void> {
     const tunnels = await this.loadTunnels();
     const tunnel = tunnels.find((t) => t.id === tunnelId);
 
@@ -525,7 +671,20 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // In external-tunnel mode (AGENT_TUNNEL=false), the URL is passed via env var.
     const envUrl = process.env.AGENT_TUNNEL_URL;
     if (envUrl) return envUrl;
-    return this.storage.get(STORAGE_NS, KEY_AGENT_URL);
+
+    const url = await this.storage.get(STORAGE_NS, KEY_AGENT_URL);
+    if (!url) return null;
+
+    // A quick-tunnel hostname only resolves while its `cloudflared` lives.
+    // Handing out the URL of a dead process is what let the control plane sit
+    // on an NXDOMAIN hostname and report the agent as Degraded — so treat a
+    // dead owner as "no tunnel" and let the supervisor rebuild it. A URL with
+    // no recorded PID is left alone: that's the externally-managed tunnel
+    // case, where liveness is not ours to judge.
+    const pid = await this.readAgentTunnelPid();
+    if (pid !== null && !isProcessAlive(pid)) return null;
+
+    return url;
   }
 
   async list(): Promise<TunnelInfo[]> {
@@ -549,6 +708,12 @@ class CloudflareTunnelProvider implements TunnelProvider {
     // Remove the record entirely from storage.
     await this.removeTunnelRecord(tunnelId);
 
+    // A deleted agent tunnel has nothing left to supervise.
+    if (tunnelId === this.agentTunnelId) {
+      this.supervisor.stop();
+      this.agentTunnelId = null;
+    }
+
     this.log.info(`Tunnel ${tunnelId} deleted`);
   }
 
@@ -559,6 +724,10 @@ class CloudflareTunnelProvider implements TunnelProvider {
    */
   detachAll(): void {
     this.log.info("Detaching from all tunnels (processes left running)");
+    // Detach hands ownership to whoever comes next (hot reload / external
+    // manager) — supervising processes we no longer own would fight them.
+    this.shuttingDown = true;
+    this.supervisor.stop();
     this.processes.clear();
   }
 
@@ -598,6 +767,21 @@ class CloudflareTunnelProvider implements TunnelProvider {
    * spawning a new one. This keeps the tunnel URL stable across hot-reloads.
    */
   async startAgentTunnel(agentPort: number): Promise<TunnelInfo> {
+    // Remember what the agent tunnel is made of BEFORE trying to build it, so
+    // the supervisor can rebuild it later even if this attempt fails.
+    this.agentTunnelPort = agentPort;
+    this.shuttingDown = false;
+    const info = await this.startAgentTunnelInternal(agentPort);
+    this.agentTunnelId = info.id;
+    // From here on the tunnel is watched: if its cloudflared dies — ours or an
+    // adopted bootstrap one — it is rebuilt without operator intervention.
+    this.supervisor.start();
+    return info;
+  }
+
+  private async startAgentTunnelInternal(
+    agentPort: number,
+  ): Promise<TunnelInfo> {
     // Adopt the bootstrap cloudflared if one is alive. The agent's
     // pre-config phase (src/core/tunnel-bootstrap.ts) spawns cloudflared
     // BEFORE finalize so the banner can print a tunnel URL.
@@ -688,6 +872,10 @@ class CloudflareTunnelProvider implements TunnelProvider {
    */
   async stopAll(): Promise<void> {
     this.log.info("Stopping all tunnels");
+    // Teardown is deliberate — stand the supervisor down before killing
+    // anything so it can't race a restart against the shutdown.
+    this.shuttingDown = true;
+    this.supervisor.stop();
 
     const tunnels = await this.loadTunnels();
 
