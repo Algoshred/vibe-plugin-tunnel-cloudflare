@@ -3,7 +3,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { isProcessAlive } from "@vibecontrols/plugin-sdk";
 import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
 
-import { CloudflareTunnelProvider } from "../src/index";
+import {
+  CloudflareTunnelProvider,
+  isUsableAgentTunnel,
+  withoutDegradedMarkers,
+} from "../src/index";
+import type { TunnelInfo } from "../src/types";
 
 /**
  * `getActiveTunnelUrl()` is what the agent's tunnel-sync publishes to the
@@ -103,5 +108,80 @@ describe("getActiveTunnelUrl", () => {
     expect(await provider.getActiveTunnelUrl()).toBe(
       "https://pinned.example.com",
     );
+  });
+});
+
+/**
+ * A rate-limited quick tunnel is recorded as `active` with a placeholder
+ * hostname and no PID, so "did the restart work?" cannot be answered by the
+ * record we started from — only by the one we got back.
+ */
+function makeInfo(over: Partial<TunnelInfo> = {}): TunnelInfo {
+  return {
+    id: "t-1",
+    providerName: "cloudflare",
+    status: "active",
+    protocol: "http",
+    localPort: 3005,
+    localHost: "127.0.0.1",
+    url: "https://abc.trycloudflare.com",
+    pid: 4242,
+    createdAt: new Date(0).toISOString(),
+    metadata: { isAgentTunnel: true },
+    ...over,
+  };
+}
+
+describe("withoutDegradedMarkers", () => {
+  it("drops the failed-attempt markers and keeps everything else", () => {
+    expect(
+      withoutDegradedMarkers({
+        isAgentTunnel: true,
+        degraded: true,
+        degradedReason: "rate limited",
+      }),
+    ).toEqual({ isAgentTunnel: true });
+  });
+
+  it("passes through metadata that carries no markers", () => {
+    expect(withoutDegradedMarkers({ name: "agent" })).toEqual({
+      name: "agent",
+    });
+    expect(withoutDegradedMarkers(undefined)).toBeUndefined();
+  });
+});
+
+describe("isUsableAgentTunnel", () => {
+  it("accepts a live tunnel with a URL and an owning process", () => {
+    expect(isUsableAgentTunnel(makeInfo())).toBe(true);
+  });
+
+  it("rejects the rate-limited placeholder", () => {
+    expect(
+      isUsableAgentTunnel(
+        makeInfo({
+          url: "https://rate-limited-t-1.trycloudflare.com",
+          pid: undefined,
+          metadata: { isAgentTunnel: true, degraded: true },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a record with no owning process or no URL", () => {
+    expect(isUsableAgentTunnel(makeInfo({ pid: undefined }))).toBe(false);
+    expect(isUsableAgentTunnel(makeInfo({ url: "" }))).toBe(false);
+  });
+
+  it("accepts a record whose stale degraded markers were cleared", () => {
+    // The exact recovery path: a retry after a rate-limit reuses the record.
+    const retried = makeInfo({
+      metadata: withoutDegradedMarkers({
+        isAgentTunnel: true,
+        degraded: true,
+        degradedReason: "rate limited",
+      }),
+    });
+    expect(isUsableAgentTunnel(retried)).toBe(true);
   });
 });

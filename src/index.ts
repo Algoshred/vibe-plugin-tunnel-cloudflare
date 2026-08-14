@@ -165,6 +165,34 @@ async function extractTunnelUrl(proc: Subprocess): Promise<string> {
   return result;
 }
 
+/**
+ * Strip the markers that describe a FAILED attempt (`degraded` +
+ * `degradedReason`, set when trycloudflare rate-limits us). They belong to the
+ * attempt, not to the tunnel, so they must not survive a successful one.
+ */
+export function withoutDegradedMarkers(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return metadata;
+  const cleaned = { ...metadata };
+  delete cleaned["degraded"];
+  delete cleaned["degradedReason"];
+  return cleaned;
+}
+
+/**
+ * True when a tunnel record describes something the agent is actually
+ * reachable through: a real URL served by a live process we know the PID of.
+ * The rate-limited placeholder (`https://rate-limited-*`, no PID) is the case
+ * this exists to reject — publishing it would advertise a hostname that has
+ * never resolved.
+ */
+export function isUsableAgentTunnel(info: TunnelInfo): boolean {
+  if (!info.url) return false;
+  if (info.metadata?.["degraded"]) return false;
+  return typeof info.pid === "number" && info.pid > 0;
+}
+
 // ---------------------------------------------------------------------------
 // CloudflareTunnelProvider
 // ---------------------------------------------------------------------------
@@ -295,9 +323,17 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       return null;
     }
 
-    if (info.metadata?.["degraded"]) return null;
+    // Judge the tunnel we actually got, not the record we started from: a
+    // rate-limited retry hands back a placeholder URL with no live process.
+    if (!isUsableAgentTunnel(info)) {
+      this.log.warn(
+        `Replacement tunnel ${info.id} is not usable yet — backing off`,
+        { url: info.url, degraded: info.metadata?.["degraded"] ?? false },
+      );
+      return null;
+    }
     await this.persistAgentTunnel(info);
-    return info.url || null;
+    return info.url;
   }
 
   /**
@@ -536,6 +572,10 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       const url = await extractTunnelUrl(proc);
       const activeInfo: TunnelInfo = {
         ...info,
+        // A retry after a rate-limit reuses the record, so the previous
+        // attempt's degraded markers are still on it. Leaving them would make
+        // a genuinely healthy tunnel read as degraded forever.
+        metadata: withoutDegradedMarkers(info.metadata),
         url,
         managedHostname: new URL(url).host,
         status: "active",
