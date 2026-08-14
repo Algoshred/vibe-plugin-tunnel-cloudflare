@@ -180,6 +180,15 @@ export class AgentTunnelSupervisor {
         });
       }
 
+      // Building a tunnel takes seconds; a teardown can have started in that
+      // window. Report it as paused rather than as a recovery, and drop the
+      // backoff so a later legitimate start isn't held off.
+      if (this.deps.isPaused()) {
+        this.attempts = 0;
+        this.nextAttemptAt = 0;
+        return "paused";
+      }
+
       if (url) {
         this.attempts = 0;
         this.nextAttemptAt = 0;

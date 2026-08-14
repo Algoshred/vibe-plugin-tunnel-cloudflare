@@ -206,10 +206,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       isAlive: (pid) => isProcessAlive(pid),
       clearAgentTunnel: () => this.clearAgentTunnelKeys(),
       restartAgentTunnel: () => this.restartAgentTunnel(),
-      isPaused: () =>
-        this.shuttingDown ||
-        (this.agentTunnelId !== null &&
-          this.intentionalStops.has(this.agentTunnelId)),
+      isPaused: () => this.isSupervisionPaused(),
       log: {
         info: (message, meta) => this.log.info(message, meta),
         warn: (message, meta) => this.log.warn(message, meta),
@@ -220,6 +217,20 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   // -----------------------------------------------------------------------
   // Agent-tunnel supervision
   // -----------------------------------------------------------------------
+
+  /**
+   * True while nobody wants the agent tunnel supervised — a teardown
+   * (shutdown / nuke / detach) or a deliberate stop of the agent tunnel is in
+   * flight. Checked on entry to a tick AND either side of a restart, because
+   * building a tunnel takes seconds and a teardown can start mid-flight.
+   */
+  private isSupervisionPaused(): boolean {
+    if (this.shuttingDown) return true;
+    return (
+      this.agentTunnelId !== null &&
+      this.intentionalStops.has(this.agentTunnelId)
+    );
+  }
 
   /** PID recorded for the agent tunnel, or null when none is persisted. */
   private async readAgentTunnelPid(): Promise<number | null> {
@@ -264,23 +275,56 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   private async restartAgentTunnel(): Promise<string | null> {
     const port = this.agentTunnelPort;
     if (port === null) return null;
+    // Re-check on entry: the supervisor's own check happened before the
+    // liveness probe awaited storage.
+    if (this.isSupervisionPaused()) return null;
 
+    const info = await this.buildReplacementTunnel(port);
+    if (!info) return null;
+
+    // Building a tunnel takes seconds — long enough for a shutdown or an
+    // explicit stop to have started meanwhile. Don't leave a cloudflared
+    // running that everyone else believes is gone.
+    if (this.isSupervisionPaused()) {
+      this.log.warn(
+        `Discarding replacement tunnel ${info.id} — teardown started while it was being built`,
+      );
+      await this.stopInternal(info.id).catch(() => {
+        /* best effort: the teardown path sweeps what's left */
+      });
+      return null;
+    }
+
+    if (info.metadata?.["degraded"]) return null;
+    await this.persistAgentTunnel(info);
+    return info.url || null;
+  }
+
+  /**
+   * Re-use the existing tunnel record when we own one (same id, fresh process,
+   * new public URL — exactly what `rotate()` does) so a flapping tunnel doesn't
+   * accumulate a record per crash. Falls back to the full start path, which
+   * also covers the adopted-bootstrap case where no record of our own exists.
+   *
+   * Deliberately calls `startAgentTunnelInternal` rather than the public
+   * `startAgentTunnel`: the latter clears `shuttingDown`, which would undo a
+   * teardown that began while this restart was in flight.
+   */
+  private async buildReplacementTunnel(
+    port: number,
+  ): Promise<TunnelInfo | null> {
     const existingId = this.agentTunnelId;
     if (existingId) {
       // Drop the dead handle so `start()` re-spawns rather than early-returning.
       this.processes.delete(existingId);
       const tunnels = await this.loadTunnels();
       if (tunnels.some((t) => t.id === existingId)) {
-        const info = await this.start(existingId);
-        if (info.metadata?.["degraded"]) return null;
-        await this.persistAgentTunnel(info);
-        return info.url || null;
+        return this.start(existingId);
       }
     }
-
-    const info = await this.startAgentTunnel(port);
-    if (info.metadata?.["degraded"]) return null;
-    return info.url || null;
+    const info = await this.startAgentTunnelInternal(port);
+    this.agentTunnelId = info.id;
+    return info;
   }
 
   /**
@@ -871,6 +915,11 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       localHost: "127.0.0.1",
       metadata: { isAgentTunnel: true, name: "agent" },
     });
+    // Claim the record BEFORE spawning. `issueSession` has already persisted
+    // it, so if the spawn fails (cloudflared exits before printing a URL) the
+    // supervisor must retry on THIS record — otherwise every retry issues a
+    // fresh session and leaves a trail of stale isAgentTunnel error rows.
+    this.agentTunnelId = session.tunnelId;
     const info = await this.start(session.tunnelId);
 
     await this.storage.set(STORAGE_NS, KEY_AGENT_URL, info.url);

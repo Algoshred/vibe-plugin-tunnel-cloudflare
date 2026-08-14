@@ -208,6 +208,22 @@ describe("AgentTunnelSupervisor.tick", () => {
     expect(state.restarts).toBe(0);
   });
 
+  it("does not claim recovery when a teardown starts mid-restart", async () => {
+    const { deps, state } = makeHarness({ alivePids: new Set<number>() });
+    state.restartResult = async () => {
+      // Shutdown lands while the replacement tunnel is being built.
+      state.paused = true;
+      return null;
+    };
+    const supervisor = new AgentTunnelSupervisor(deps);
+
+    expect(await supervisor.tick()).toBe("paused");
+    // No backoff armed either — a later legitimate start must not be delayed.
+    state.paused = false;
+    state.restartResult = async () => "https://after-restart.trycloudflare.com";
+    expect(await supervisor.tick()).toBe("restarted");
+  });
+
   it("never runs two ticks concurrently", async () => {
     const { deps, state } = makeHarness({ alivePids: new Set<number>() });
     let release!: (url: string | null) => void;
