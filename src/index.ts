@@ -782,12 +782,17 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     // the supervisor can rebuild it later even if this attempt fails.
     this.agentTunnelPort = agentPort;
     this.shuttingDown = false;
-    const info = await this.startAgentTunnelInternal(agentPort);
-    this.agentTunnelId = info.id;
-    // From here on the tunnel is watched: if its cloudflared dies — ours or an
-    // adopted bootstrap one — it is rebuilt without operator intervention.
-    this.supervisor.start();
-    return info;
+    try {
+      const info = await this.startAgentTunnelInternal(agentPort);
+      this.agentTunnelId = info.id;
+      return info;
+    } finally {
+      // Supervision starts even when this attempt threw (transient cloudflared
+      // or network failure). Otherwise the one case that most needs retrying —
+      // never got a tunnel at all — would be the one case that never retries,
+      // leaving the agent with no inbound path until a manual restart.
+      this.supervisor.start();
+    }
   }
 
   private async startAgentTunnelInternal(
