@@ -166,6 +166,29 @@ async function extractTunnelUrl(proc: Subprocess): Promise<string> {
 }
 
 /**
+ * Should the agent-tunnel supervisor keep its hands off?
+ *
+ * Pulled out as a pure rule because the answer has to survive a *race*: a
+ * restart takes seconds, and a teardown can begin at any point inside it. The
+ * transient `intentionalStops` marker is cleared as soon as `stop()` returns,
+ * so an in-flight tick could see it gone and resurrect a tunnel the operator
+ * just stopped — hence `agentTunnelDisabled`, which latches until something
+ * deliberately starts the agent tunnel again.
+ */
+export function isAgentSupervisionPaused(state: {
+  shuttingDown: boolean;
+  agentTunnelDisabled: boolean;
+  agentTunnelId: string | null;
+  intentionalStops: ReadonlySet<string>;
+}): boolean {
+  if (state.shuttingDown || state.agentTunnelDisabled) return true;
+  return (
+    state.agentTunnelId !== null &&
+    state.intentionalStops.has(state.agentTunnelId)
+  );
+}
+
+/**
  * Strip the markers that describe a FAILED attempt (`degraded` +
  * `degradedReason`, set when trycloudflare rate-limits us). They belong to the
  * attempt, not to the tunnel, so they must not survive a successful one.
@@ -219,8 +242,21 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   private agentTunnelId: string | null = null;
   /** Set while the provider is tearing down (shutdown / nuke). */
   private shuttingDown = false;
+  /**
+   * Latched when the agent tunnel is deliberately stopped or deleted, and
+   * cleared only by `startAgentTunnel`. Unlike `intentionalStops` this
+   * outlives the stop call itself, so a restart still in flight can't resume
+   * afterwards and re-create what the caller just took down.
+   */
+  private agentTunnelDisabled = false;
   /** Tunnel ids being stopped on purpose — their exits are not crashes. */
   private readonly intentionalStops = new Set<string>();
+  /**
+   * Per-tunnel start counter. A `start()` that loses the race (its cloudflared
+   * died while a newer attempt already took over the record) must not write
+   * its failure over the newer attempt's `active` row.
+   */
+  private readonly startEpoch = new Map<string, number>();
 
   constructor(hostServices: HostServices) {
     this.hostServices = hostServices;
@@ -253,11 +289,12 @@ export class CloudflareTunnelProvider implements TunnelProvider {
    * building a tunnel takes seconds and a teardown can start mid-flight.
    */
   private isSupervisionPaused(): boolean {
-    if (this.shuttingDown) return true;
-    return (
-      this.agentTunnelId !== null &&
-      this.intentionalStops.has(this.agentTunnelId)
-    );
+    return isAgentSupervisionPaused({
+      shuttingDown: this.shuttingDown,
+      agentTunnelDisabled: this.agentTunnelDisabled,
+      agentTunnelId: this.agentTunnelId,
+      intentionalStops: this.intentionalStops,
+    });
   }
 
   /** PID recorded for the agent tunnel, or null when none is persisted. */
@@ -516,6 +553,13 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
     this.log.info(`Starting tunnel ${tunnelId} → ${localUrl}`);
 
+    // Claim this attempt. Everything below only writes to the record while it
+    // is still the current attempt — a start that lost the race must never
+    // stamp its failure over a newer attempt's `active` row.
+    const epoch = (this.startEpoch.get(tunnelId) ?? 0) + 1;
+    this.startEpoch.set(tunnelId, epoch);
+    const isCurrentAttempt = () => this.startEpoch.get(tunnelId) === epoch;
+
     const proc = Bun.spawn(
       [resolveCloudflaredCmd(), "tunnel", "--url", localUrl],
       {
@@ -532,7 +576,9 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       // A deliberate stop kills the process before clearing the handle, so
       // only treat an exit as a crash when nobody asked for it.
       if (this.shuttingDown || this.intentionalStops.has(tunnelId)) return;
-      if (!this.processes.has(tunnelId)) return;
+      // Our own handle, our own attempt — otherwise a newer start owns this id
+      // and both the handle and the record belong to it.
+      if (this.processes.get(tunnelId) !== proc || !isCurrentAttempt()) return;
 
       this.log.warn(
         `Tunnel ${tunnelId} process exited unexpectedly (code=${code})`,
@@ -546,7 +592,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       try {
         const current = await this.loadTunnels();
         const idx = current.findIndex((t) => t.id === tunnelId);
-        if (idx >= 0) {
+        if (idx >= 0 && isCurrentAttempt()) {
           current[idx] = {
             ...current[idx]!,
             status: "error",
@@ -586,10 +632,18 @@ export class CloudflareTunnelProvider implements TunnelProvider {
       this.log.info(`Tunnel ${tunnelId} active at ${url} (PID ${proc.pid})`);
       return activeInfo;
     } catch (err) {
-      this.processes.delete(tunnelId);
+      // Always reap our own process; only touch shared state while we still
+      // own the id. A crash during URL extraction wakes the exit handler,
+      // which can have driven a full recovery by the time we get here —
+      // deleting the handle or writing an `error` row then would clobber the
+      // tunnel that recovery just brought up.
+      if (this.processes.get(tunnelId) === proc) {
+        this.processes.delete(tunnelId);
+      }
       if (isProcessAlive(proc.pid)) {
         await sdkGracefulKill(proc.pid, KILL_GRACE_MS);
       }
+      if (!isCurrentAttempt()) throw err;
       // Quick-tunnel rate-limited by trycloudflare.com (429 / error 1015).
       // Mark the tunnel as `rate-limited` and surface a placeholder URL so
       // callers can distinguish "rate-limited, retry later" from a real
@@ -692,13 +746,16 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     // cleared in `finally` — never left latched.
     this.intentionalStops.add(tunnelId);
     try {
-      await this.stopInternal(tunnelId);
-      // An operator (or the control plane) asking for the agent tunnel to go
-      // down means it should STAY down — supervision resumes only when
-      // something starts it again.
+      // Latch BEFORE the teardown: a supervisor tick that is already mid-restart
+      // must see "disabled" the moment the stop begins, not after it finishes.
+      // `supervisor.stop()` only cancels future intervals — it cannot cancel a
+      // tick already in flight, and that tick re-checks the pause state before
+      // it accepts the tunnel it built.
       if (tunnelId === this.agentTunnelId) {
+        this.agentTunnelDisabled = true;
         this.supervisor.stop();
       }
+      await this.stopInternal(tunnelId);
     } finally {
       this.intentionalStops.delete(tunnelId);
     }
@@ -805,6 +862,7 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
     // A deleted agent tunnel has nothing left to supervise.
     if (tunnelId === this.agentTunnelId) {
+      this.agentTunnelDisabled = true;
       this.supervisor.stop();
       this.agentTunnelId = null;
     }
@@ -865,7 +923,10 @@ export class CloudflareTunnelProvider implements TunnelProvider {
     // Remember what the agent tunnel is made of BEFORE trying to build it, so
     // the supervisor can rebuild it later even if this attempt fails.
     this.agentTunnelPort = agentPort;
+    // The one entry point that means "the agent tunnel is wanted" — the only
+    // place a deliberate stop/delete is un-latched.
     this.shuttingDown = false;
+    this.agentTunnelDisabled = false;
     try {
       const info = await this.startAgentTunnelInternal(agentPort);
       this.agentTunnelId = info.id;

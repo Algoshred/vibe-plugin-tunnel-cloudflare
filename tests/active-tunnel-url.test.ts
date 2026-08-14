@@ -5,6 +5,7 @@ import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
 
 import {
   CloudflareTunnelProvider,
+  isAgentSupervisionPaused,
   isUsableAgentTunnel,
   withoutDegradedMarkers,
 } from "../src/index";
@@ -183,5 +184,51 @@ describe("isUsableAgentTunnel", () => {
       }),
     });
     expect(isUsableAgentTunnel(retried)).toBe(true);
+  });
+});
+
+describe("isAgentSupervisionPaused", () => {
+  const base = {
+    shuttingDown: false,
+    agentTunnelDisabled: false,
+    agentTunnelId: "agent-1",
+    intentionalStops: new Set<string>(),
+  };
+
+  it("lets supervision run in the normal case", () => {
+    expect(isAgentSupervisionPaused(base)).toBe(false);
+  });
+
+  it("pauses during a teardown", () => {
+    expect(isAgentSupervisionPaused({ ...base, shuttingDown: true })).toBe(
+      true,
+    );
+  });
+
+  it("pauses while the agent tunnel is being stopped", () => {
+    expect(
+      isAgentSupervisionPaused({
+        ...base,
+        intentionalStops: new Set(["agent-1"]),
+      }),
+    ).toBe(true);
+  });
+
+  it("ignores a deliberate stop of some OTHER tunnel", () => {
+    expect(
+      isAgentSupervisionPaused({
+        ...base,
+        intentionalStops: new Set(["some-other-tunnel"]),
+      }),
+    ).toBe(false);
+  });
+
+  it("stays paused after the stop marker is gone, until a start re-enables it", () => {
+    // The race this latch exists for: `stop()` clears its transient marker as
+    // soon as it returns, but a restart already in flight must not resume and
+    // re-create the tunnel the caller just took down.
+    expect(
+      isAgentSupervisionPaused({ ...base, agentTunnelDisabled: true }),
+    ).toBe(true);
   });
 });
