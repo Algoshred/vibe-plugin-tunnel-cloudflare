@@ -60,10 +60,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/algoshred/vibe-plugin-tunnel-cloudflare.git"
+    "url": "git+https://github.com/Algoshred/vibe-plugin-tunnel-cloudflare.git"
   },
   "bugs": {
-    "url": "https://github.com/algoshred/vibe-plugin-tunnel-cloudflare/issues"
+    "url": "https://github.com/Algoshred/vibe-plugin-tunnel-cloudflare/issues"
   },
   "homepage": "https://vibecontrols.com",
   "publishConfig": {
