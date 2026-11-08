@@ -1,0 +1,3 @@
+# Formatting-only commits (git blame --ignore-revs-file .git-blame-ignore-revs).
+# bun fmt over the whole repository (BOFF-10675).
+ac21e2373c937ce6f5b2cdb2505d6f26749a8b03
