@@ -252,7 +252,6 @@ export class CloudflareTunnelProvider implements TunnelProvider {
 
   private readonly storage: AgentStorageProvider;
   private readonly log: BoundLogger;
-  private readonly hostServices: HostServices;
 
   /**
    * Agent-tunnel supervision state. The agent tunnel (and only the agent
@@ -283,7 +282,6 @@ export class CloudflareTunnelProvider implements TunnelProvider {
   private readonly startEpoch = new Map<string, number>();
 
   constructor(hostServices: HostServices) {
-    this.hostServices = hostServices;
     // The agent's runtime storage surface is richer than the SDK's neutral
     // StorageProvider (delete returns void; deleteAll sweeper). Narrow via
     // a single structural cast at the boundary.
