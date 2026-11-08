@@ -9,11 +9,7 @@
  */
 
 export type TunnelStatus =
-  | "starting"
-  | "active"
-  | "stopping"
-  | "stopped"
-  | "error";
+  "starting" | "active" | "stopping" | "stopped" | "error";
 
 export type TunnelProtocol = "http" | "https" | "tcp" | "udp";
 
